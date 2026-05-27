@@ -1,5 +1,11 @@
 # Informe Concu — Sistema de Alquiler de Bicicletas
- 
+
+| Nombre del integrante            | Padrón  |
+|-------------------|---------|
+| Emiliano Gomez    | 110042  |
+| Guido Mazzucco    | 111310  |
+| Javier Menechian  | 107942  |
+
 En el siguiente informe se describen las entidades, mensajes y decisiones de diseño que conforman el sistema distribuido para el alquiler y devolución automatizado de bicicletas en una ciudad. El sistema está implementado en Rust utilizando Actix como framework de actores y Tokio como runtime asincrónico.
  
 Las entidades principales son:
