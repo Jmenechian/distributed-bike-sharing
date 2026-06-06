@@ -46,3 +46,44 @@ impl Handler<ConsultarBici> for Slot {
         }
     }
 }
+
+pub struct ReservarBici;
+
+impl Message for ReservarBici {
+    type Result = Result<(), String>;
+}
+
+impl Handler<ReservarBici> for Slot {
+    type Result = Result<(), String>;
+    fn handle(&mut self, _msg: ReservarBici, _ctx: &mut Context<Self>) -> Self::Result {
+        match &self.estado {
+            EstadoSlot::Disponible { bici_id } => {
+                let bici_id = bici_id.clone();
+                self.estado = EstadoSlot::Reservado { bici_id };
+                Ok(())
+            }
+            _ => Err("Slot no disponible".to_string()), //tal vez no hace falta
+        }
+    }
+}
+
+pub struct TomarBici;
+
+impl Message for TomarBici {
+    type Result = Result<String, u32>;
+}
+
+impl Handler<TomarBici> for Slot {
+    type Result = Result<String, u32>;
+
+    fn handle(&mut self, _msg: TomarBici, _ctx: &mut Context<Self>) -> Self::Result {
+        match &self.estado {
+            EstadoSlot::Reservado { bici_id } => {
+                let bici_id = bici_id.clone();
+                self.estado = EstadoSlot::Vacio;
+                Ok(bici_id.clone())
+            }
+            _ => Err(0),
+        }
+    }
+}
