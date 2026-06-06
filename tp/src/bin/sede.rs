@@ -1,14 +1,15 @@
+use actix::prelude::*;
 use actix::{Actor, Addr, Context, Handler, MessageResult, ResponseFuture};
 use matenmutex::messages::clientesede::{
     DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
+use matenmutex::messages::sede_cliente::RespuestaSolicitarBici;
 use matenmutex::slot;
-use matenmutex::slot::{ConsultarBici, Slot};
+use matenmutex::slot::{ConsultarBici, ReservarBici, Slot, TomarBici};
 use matenmutex::types::{Bici, BiciAlquilada};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use matenmutex::messages::sede_cliente::RespuestaSolicitarBici;
 
 const DISTANCIA_MINIMA: f64 = 2.0;
 
@@ -27,7 +28,8 @@ impl Sede {
         let (coords_sede_x, coords_sede_y) = self.coords;
         let (coords_cliente_x, coords_cliente_y) = coords;
 
-        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
+        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2))
+            .sqrt()
     }
 }
 
@@ -36,26 +38,88 @@ impl Actor for Sede {
 }
 
 impl Handler<SolicitarBici> for Sede {
-    type Result = MessageResult<SolicitarBici>;
+    type Result = ResponseActFuture<Self, RespuestaSolicitarBici>; //futures actor porque tenes que usar info de self
 
-    fn handle(&mut self, msg: SolicitarBici, ctx: &mut Context<Self>) -> Self::Result {
-        println!("Hola Bici");
+    fn handle(&mut self, msg: SolicitarBici, _ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
-            return MessageResult(RespuestaSolicitarBici::AlquilerRechazado(
-                String::from("Para poder tomar la bici debe estar mas cerca de la sede")
-            ));
+            return Box::pin(
+                async {
+                    //wrapper future
+                    RespuestaSolicitarBici::AlquilerRechazado(
+                        "Para poder tomar la bici debe estar mas cerca de la sede".to_string(),
+                    )
+                }
+                .into_actor(self),
+            ); //future a actorfuture (responseActFuture)
         }
 
-        MessageResult(RespuestaSolicitarBici::AlquilerConfirmado(
-            BiciAlquilada::new(
-                "1".to_string(),
-                "1".to_string(),
-                msg.cliente_id.to_string(),
-                self.sede_id,
-                0,
-                "1".to_string()
-            )
-        ))
+        let mut consultas = Vec::new();
+        for slot in self.slots.iter() {
+            consultas.push(slot.send(ConsultarBici))
+        }
+
+        let slots_refs: Vec<Addr<Slot>> = self.slots.clone();
+        let cliente_id = msg.cliente_id.clone();
+        let sede_id = self.sede_id;
+
+        Box::pin(
+            async move {
+                let resultados = futures::future::join_all(consultas).await;
+
+                let mut slot_disponible = None;
+                for (addr, res) in slots_refs.iter().zip(resultados.iter()) {
+                    if matches!(res, Ok(estado) if estado.contains("disponible")) {
+                        slot_disponible = Some(addr.clone());
+                        break;
+                    }
+                }
+                slot_disponible
+            }
+            .into_actor(self)
+            .then(move |slot_opt, actor, _ctx| {
+                // move toma ownership (para cliente_id y sede_id)
+                async move {
+                    match slot_opt {
+                        None => RespuestaSolicitarBici::AlquilerRechazado(
+                            // no hay bicis disponibles
+                            "No hay bicis disponibles".to_string(),
+                        ),
+                        Some(slot) => {
+                            // 2. Reservar el slot
+                            let reserva = slot.send(ReservarBici).await;
+
+                            match reserva {
+                                Ok(Ok(())) => {
+                                    let toma = slot.send(TomarBici).await;
+                                    match toma {
+                                        Ok(Ok(bici_id)) => {
+                                            RespuestaSolicitarBici::AlquilerConfirmado(
+                                                BiciAlquilada::new(
+                                                    bici_id,
+                                                    "1".to_string(),
+                                                    cliente_id.to_string(),
+                                                    sede_id,
+                                                    0,
+                                                    "1".to_string(),
+                                                ),
+                                            )
+                                        }
+                                        _ => RespuestaSolicitarBici::AlquilerRechazado( //vemos si quedan o se van
+                                            "Error al tomar la bici".to_string(),
+                                        ),
+                                    }
+                                }
+                                _ => RespuestaSolicitarBici::AlquilerRechazado(
+                                    //race condition?
+                                    "No se pudo reservar el slot".to_string(),
+                                ),
+                            }
+                        }
+                    }
+                }
+                .into_actor(actor)
+            }),
+        )
     }
 }
 
@@ -145,5 +209,4 @@ async fn main() {
             println!("Connection from {} closed", addr);
         });
     }
-
 }

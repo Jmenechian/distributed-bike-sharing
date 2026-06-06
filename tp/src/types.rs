@@ -16,8 +16,15 @@ pub struct BiciAlquilada {
 }
 
 impl BiciAlquilada {
-    pub fn new(bici_id: String, alquiler_id: String, cliente_id: String, sede_origen_id: u32, inicio_ts: u64, token_alquiler: String) -> Self {
-        BiciAlquilada{
+    pub fn new(
+        bici_id: String,
+        alquiler_id: String,
+        cliente_id: String,
+        sede_origen_id: u32,
+        inicio_ts: u64,
+        token_alquiler: String,
+    ) -> Self {
+        BiciAlquilada {
             bici_id,
             alquiler_id,
             cliente_id,

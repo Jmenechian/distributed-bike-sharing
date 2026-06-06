@@ -1,7 +1,7 @@
-use actix::Message;
-use serde::{Deserialize, Serialize};
 use crate::messages::sede_cliente::RespuestaSolicitarBici;
 use crate::types::Bici;
+use actix::Message;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 pub struct SolicitarBici {
