@@ -1,10 +1,14 @@
-use std::collections::HashMap;
 use std::env;
+use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use matenmutex::messages::procesadores::MsgProcesador;
 use serde::Deserialize;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::time::interval;
 
 const CONFIG_FILE: usize = 1;
 const MINIMAL_LENGTH: usize = 2;
@@ -28,20 +32,27 @@ struct ProcesadorPagosConfig {
     rol: RolConfig,
 }
 
+struct Lider {
+    socket: UdpSocket,
+    replicas: Vec<SocketAddr>,
+}
+
+struct Replica {
+    socket: UdpSocket,
+    lider_addr: SocketAddr,
+    peers: Vec<SocketAddr>,
+}
+
 enum Rol {
-    Lider {
-        replicas: HashMap<SocketAddr, Option<TcpStream>>,
-    },
-    Replica {
-        lider: TcpStream,
-    },
+    Lider(Lider),
+    Replica(Replica),
 }
 
 struct ProcesadorPagos {
     procesador_id: u32,
     public_listener: TcpListener,
-    private_listener: TcpListener,
-    rol: Rol,
+    private_addr: SocketAddr,
+    rol_config: RolConfig,
 }
 
 impl ProcesadorPagos {
@@ -50,36 +61,89 @@ impl ProcesadorPagos {
         let config: ProcesadorPagosConfig = serde_json::from_reader(BufReader::new(file))?;
 
         let public_listener = TcpListener::bind(config.public_addr).await?;
-        let private_listener = TcpListener::bind(config.private_addr).await?;
-
-        let rol = match config.rol {
-            RolConfig::Lider { replicas } => {
-                let replicas = replicas.into_iter().map(|addr| (addr, None)).collect();
-                Rol::Lider { replicas }
-            }
-            RolConfig::Replica { lider_addr, peers: _ } => {
-                let lider = TcpStream::connect(lider_addr).await?;
-                Rol::Replica { lider }
-            }
-        };
 
         Ok(Self {
             procesador_id: config.procesador_id,
             public_listener,
-            private_listener,
-            rol,
+            private_addr: config.private_addr,
+            rol_config: config.rol,
         })
     }
 
-    async fn init(self) {
-        match self.rol {
-            Rol::Lider { replicas: _replicas } => {
-                todo!("aceptar las conexiones de las replicas")
+    async fn init(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let rol = self.get_rol_from_config().await?;
+
+        let (socket, destinos, etiqueta) = match rol {
+            Rol::Lider(lider) => (Arc::new(lider.socket), lider.replicas, "LIDER"),
+            Rol::Replica(replica) => (Arc::new(replica.socket), vec![replica.lider_addr], "REPLICA"),
+        };
+
+        // Tarea que envía heartbeats a todos los destinos cada 5 segundos
+        let socket_hb = socket.clone();
+        let procesador_id = self.procesador_id;
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let msg = MsgProcesador::Heartbeat { procesador_id };
+                let payload = match serde_json::to_vec(&msg) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        println!("[{}]: Error serializando heartbeat: {}", etiqueta, e);
+                        continue;
+                    }
+                };
+                for destino in &destinos {
+                    match socket_hb.send_to(&payload, destino).await {
+                        Ok(_) => {
+                            println!("[{}]: Mensaje enviado a {}: {:?}", etiqueta, destino, msg);
+                        }
+                        Err(e) => {
+                            println!("[{}]: Error enviando heartbeat a {}: {}", etiqueta, destino, e);
+                        }
+                    }
+                }
             }
-            Rol::Replica { lider: _lider } => {
-                // comunicarse con el lider ¿?
+        });
+
+        // Loop receptor: procesa los mensajes entrantes (incluidos los heartbeats de otros)
+        let mut buf = [0u8; 1024];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((size, from)) => {
+                    match serde_json::from_slice::<MsgProcesador>(&buf[..size]) {
+                        Ok(msg) => {
+                            println!("[{}]: Mensaje recibido de {}: {:?}", etiqueta, from, msg);
+                        }
+                        Err(e) => {
+                            println!("[{}]: Mensaje invalido de {}: {}", etiqueta, from, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[{}]: Fallo al recibir datagrama: {}", etiqueta, e);
+                }
             }
         }
+    }
+
+    async fn get_rol_from_config(&self) -> Result<Rol, Box<dyn Error>> {
+        let socket = UdpSocket::bind(self.private_addr).await?;
+        Ok(match &self.rol_config {
+            RolConfig::Lider { replicas } => {
+                Rol::Lider(Lider {
+                    socket,
+                    replicas: replicas.clone(),
+                })
+            },
+            RolConfig::Replica { lider_addr, peers } => {
+                Rol::Replica(Replica {
+                    socket,
+                    lider_addr: *lider_addr,
+                    peers: peers.clone(),
+                })
+            }
+        })
     }
 }
 
@@ -94,7 +158,11 @@ async fn main() {
     let file_path = &args[CONFIG_FILE];
 
     match ProcesadorPagos::from_json(file_path).await {
-        Ok(procesador) => procesador.init().await,
+        Ok(procesador) => {
+            if let Err(err) = procesador.init().await {
+                println!("{}", err);
+            }
+        }
         Err(err) => println!("{}", err),
     }
 }
