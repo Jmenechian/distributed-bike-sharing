@@ -79,8 +79,8 @@ impl Handler<ConsultarBici> for Slot {
 
     fn handle(&mut self, _msg: ConsultarBici, _ctx: &mut Context<Self>) -> Self::Result {
         match &self.estado {
-            EstadoSlot::Disponible { bici_id } => format!("Slot {}: (disponible)", self.slot_id),
-            EstadoSlot::Reservado { bici_id } => format!("Slot {}: (reservado)", self.slot_id),
+            EstadoSlot::Disponible { bici_id: _ } => format!("Slot {}: (disponible)", self.slot_id),
+            EstadoSlot::Reservado { bici_id: _ } => format!("Slot {}: (reservado)", self.slot_id),
             EstadoSlot::Vacio => format!("Slot {}: sin bici", self.slot_id),
         }
     }
