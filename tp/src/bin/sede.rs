@@ -1,9 +1,9 @@
-use actix::{Actor, Addr, Context, Handler, MailboxError, ResponseFuture};
+use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, ResponseFuture};
 use matenmutex::messages::cliente_sede::{
-    DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
+    AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
 use matenmutex::slot;
-use matenmutex::slot::{AsegurarBici, ConsultarBici, Reservar, ResultadoReserva, Confirmar, Slot};
+use matenmutex::slot::{AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
 use serde::Serialize;
@@ -20,6 +20,7 @@ pub struct Sede {
     coords: (f64, f64),
     slots: Vec<Addr<Slot>>,
     token_secret: [u8; SECRET_LEN],
+    pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
 }
 
 impl Sede {
@@ -34,9 +35,7 @@ impl Sede {
         ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
 
-    async fn generar_respuesta(slots: Vec<Addr<Slot>>, sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], idx: usize, bici_id: String) -> RespuestaSolicitarBici {
-        let _ = slots[idx].send(Confirmar).await;
-
+    fn generar_comprobante(sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], bici_id: String) -> BiciAlquilada {
         let alquiler_id = Uuid::new_v4().to_string();
         let inicio_ts = timestamp_actual();
 
@@ -47,16 +46,9 @@ impl Sede {
             sede_origen_id: sede_id,
             inicio_ts,
         };
-        let token_alquiler = token::generar_token(&payload, &token_secret);
+        let token_alquiler = token::generar_token(&payload, token_secret);
 
-        RespuestaSolicitarBici::AlquilerConfirmado(BiciAlquilada::new(
-            bici_id,
-            alquiler_id,
-            cliente_id.to_string(),
-            sede_id,
-            inicio_ts,
-            token_alquiler,
-        ))
+        BiciAlquilada::new(bici_id, alquiler_id, cliente_id.to_string(), sede_id, inicio_ts, token_alquiler)
     }
 
     async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
@@ -83,28 +75,70 @@ impl Actor for Sede {
 impl Handler<SolicitarBici> for Sede {
     type Result = ResponseFuture<RespuestaSolicitarBici>;
 
-    fn handle(&mut self, msg: SolicitarBici, _ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: SolicitarBici, ctx: &mut Context<Self>) -> Self::Result {
         println!("Hola Bici");
 
         if !self.cliente_en_rango(msg.coords) {
-            return Box::pin(async move {
-                RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede"))
-            });
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede")) });
         }
 
         let slots = self.slots.clone();
         let sede_id = self.sede_id;
         let cliente_id = msg.cliente_id;
         let token_secret = self.token_secret;
+        let sede_addr = ctx.address();
 
         Box::pin(async move {
-            let bici_ganadora: Option<(usize, String)> = Self::reservar_bici(&slots).await;
-
-            match bici_ganadora {
-                Some((idx, bici_id)) => { Self::generar_respuesta(slots, sede_id, cliente_id, &token_secret, idx, bici_id).await }
-                None => RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento")),
+            match Self::reservar_bici(&slots).await {
+                None => {
+                    println!("[sede] Envia AlquilerRechazado: no hay slots disponibles");
+                    RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento"))
+                }
+                Some((idx, bici_id)) => {
+                    let bici = Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id);
+                    println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
+                    let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
+                    RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)
+                }
             }
         })
+    }
+}
+
+struct GuardarReserva {
+    alquiler_id: String,
+    slot_idx: usize,
+    bici: BiciAlquilada,
+}
+
+impl actix::Message for GuardarReserva {
+    type Result = ();
+}
+
+impl Handler<GuardarReserva> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: GuardarReserva, _ctx: &mut Context<Self>) {
+        self.pending_reservas.insert(msg.alquiler_id, (msg.slot_idx, msg.bici));
+    }
+}
+
+impl Handler<AckComprobanteAlquiler> for Sede {
+    type Result = ResponseFuture<RespuestaSolicitarBici>;
+
+    fn handle(&mut self, msg: AckComprobanteAlquiler, _ctx: &mut Context<Self>) -> Self::Result {
+        match self.pending_reservas.remove(&msg.alquiler_id) {
+            None => Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay reserva pendiente para ese alquiler")) }),
+            Some((slot_idx, bici)) => {
+                let slots = self.slots.clone();
+                println!("[sede] Recibe AckComprobanteAlquiler (alquiler {}) confirmando slot {}", msg.alquiler_id, slot_idx);
+                Box::pin(async move {
+                    let _ = slots[slot_idx].send(Confirmar).await;
+                    println!("[sede] Envia AlquilerConfirmado (bici {})", bici.bici_id());
+                    RespuestaSolicitarBici::AlquilerConfirmado(bici)
+                })
+            }
+        }
     }
 }
 
@@ -163,7 +197,7 @@ impl Handler<PreguntarBicis> for Sede {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matenmutex::messages::cliente_sede::{DevolverBici, SolicitarBici};
+    use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
@@ -174,6 +208,7 @@ mod tests {
             coords: (-34.6037, -58.3816),
             slots,
             token_secret: token::cargar_secret("secreto-de-test"),
+            pending_reservas: std::collections::HashMap::new(),
         }
         .start()
     }
@@ -198,15 +233,31 @@ mod tests {
             .await
             .unwrap();
 
-        match respuesta {
-            RespuestaSolicitarBici::AlquilerConfirmado(bici_alquilada) => {
-                assert_eq!(bici_alquilada.bici_id(), "1-3");
-                assert!(!bici_alquilada.alquiler_id().is_empty());
-                assert!(bici_alquilada.inicio_ts() > 0);
-            }
+        let bici_alquilada = match respuesta {
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici) => bici,
             RespuestaSolicitarBici::AlquilerRechazado(motivo) => {
-                panic!("se esperaba AlquilerConfirmado, se obtuvo AlquilerRechazado({motivo})");
+                panic!("se esperaba ComprobanteAlquilerEmitido, se obtuvo AlquilerRechazado({motivo})");
             }
+            RespuestaSolicitarBici::AlquilerConfirmado(_) => {
+                panic!("se esperaba ComprobanteAlquilerEmitido, no AlquilerConfirmado directo");
+            }
+        };
+
+        assert_eq!(bici_alquilada.bici_id(), "1-3");
+        assert!(!bici_alquilada.alquiler_id().is_empty());
+        assert!(bici_alquilada.inicio_ts() > 0);
+
+        let alquiler_id = bici_alquilada.alquiler_id().to_string();
+        let respuesta_final = sede
+            .send(AckComprobanteAlquiler { alquiler_id })
+            .await
+            .unwrap();
+
+        match respuesta_final {
+            RespuestaSolicitarBici::AlquilerConfirmado(bici) => {
+                assert_eq!(bici.bici_id(), "1-3");
+            }
+            other => panic!("se esperaba AlquilerConfirmado, se obtuvo {:?}", other),
         }
     }
 
@@ -229,8 +280,8 @@ mod tests {
 
         match respuesta {
             RespuestaSolicitarBici::AlquilerRechazado(_) => {}
-            RespuestaSolicitarBici::AlquilerConfirmado(_) => {
-                panic!("se esperaba AlquilerRechazado, se obtuvo AlquilerConfirmado");
+            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_) => {
+                panic!("se esperaba AlquilerRechazado");
             }
         }
     }
@@ -255,14 +306,14 @@ mod tests {
             })
         );
 
-        let confirmados = [resp_a.unwrap(), resp_b.unwrap()]
+        let ganadores = [resp_a.unwrap(), resp_b.unwrap()]
             .into_iter()
-            .filter(|r| matches!(r, RespuestaSolicitarBici::AlquilerConfirmado(_)))
+            .filter(|r| matches!(r, RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_)))
             .count();
-        let rechazados_count = 2 - confirmados;
+        let rechazados = 2 - ganadores;
 
-        assert_eq!(confirmados, 1, "exactamente un cliente debe ganar la bici");
-        assert_eq!(rechazados_count, 1, "exactamente un cliente debe ser rechazado");
+        assert_eq!(ganadores, 1, "exactamente un cliente debe recibir el comprobante");
+        assert_eq!(rechazados, 1, "exactamente un cliente debe ser rechazado");
     }
 
     #[actix_rt::test]
@@ -391,6 +442,7 @@ async fn main() {
         coords: (-34.6037, -58.3816),
         slots: slots,
         token_secret,
+        pending_reservas: std::collections::HashMap::new(),
     }
     .start();
 
@@ -422,6 +474,9 @@ async fn main() {
             while let Ok(Some(line)) = lines.next_line().await {
                 let response = match serde_json::from_str::<MsgClienteASede>(line.trim()) {
                     Ok(MsgClienteASede::SolicitarBici(msg)) => {
+                        formatear_respuesta(sede.send(msg).await).await
+                    }
+                    Ok(MsgClienteASede::AckComprobanteAlquiler(msg)) => {
                         formatear_respuesta(sede.send(msg).await).await
                     }
                     Ok(MsgClienteASede::DevolverBici(msg)) => {

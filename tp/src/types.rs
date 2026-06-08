@@ -13,7 +13,7 @@ pub struct Bici {
     pub bici_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BiciAlquilada {
     bici_id: String,
     alquiler_id: String,

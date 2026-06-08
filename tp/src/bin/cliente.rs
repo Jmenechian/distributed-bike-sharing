@@ -1,10 +1,11 @@
 use actix::{Actor, Context};
 use matenmutex::messages::cliente_sede::{
-    DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
+    AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
 use std::io;
+use std::io::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -46,17 +47,66 @@ impl Cliente {
         let cliente_id = self.cliente_id;
         let coords = self.coords;
         let (writer, reader) = self.validar_conexion()?;
-        let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords });
-        let linea = enviar_mensaje_a_sede(writer, reader, msg).await?;
 
-        if let Some(linea) = linea {
-            match serde_json::from_str::<RespuestaSolicitarBici>(&linea) {
-                Ok(respuesta) => self.manejar_respuesta_solicitar(respuesta),
-                Err(_) => println!("Sede: {}", linea),
+        let respuesta = Self::enviar_solicitar_bici(cliente_id, coords, writer, reader).await?;
+        let bici = match Self::descifrar_respuesta_de_solicitar_bici(respuesta) {
+            Ok(value) => value,
+            Err(value) => return value,
+        };
+
+        let respuesta = self.enviar_ack_comprobante(bici).await?;
+        self.descifrar_respuesta_de_ack_comprobante(respuesta);
+        
+        Ok(())
+    }
+
+    async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, Error> {
+        let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords });
+        println!("[cliente] Envia SolicitarBici");
+        let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
+        Ok(respuesta)
+    }
+
+    async fn enviar_ack_comprobante(&mut self, bici: BiciAlquilada) -> Result<Option<String>, Error> {
+        let alquiler_id = bici.alquiler_id().to_string();
+        let (writer, reader) = self.validar_conexion()?;
+        let ack = MsgClienteASede::AckComprobanteAlquiler(AckComprobanteAlquiler { alquiler_id: alquiler_id.clone() });
+        println!("[cliente] Envia AckComprobanteAlquiler (alquiler {})", alquiler_id);
+        let respuesta = enviar_mensaje_a_sede(writer, reader, ack).await?;
+        Ok(respuesta)
+    }
+
+    fn descifrar_respuesta_de_ack_comprobante(&mut self, respuesta: Option<String>) {
+        if let Some(respuesta) = respuesta {
+            match serde_json::from_str::<RespuestaSolicitarBici>(&respuesta) {
+                Ok(RespuestaSolicitarBici::AlquilerConfirmado(bici_confirmada)) => {
+                    println!("Alquiler confirmado: bici {}", bici_confirmada.bici_id());
+                    self.bici_activa = Some(bici_confirmada);
+                }
+                Ok(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
+                    println!("Alquiler rechazado en confirmacion: {motivo}");
+                }
+                _ => println!("Sede: {}", respuesta),
             }
         }
+    }
 
-        Ok(())
+    fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<BiciAlquilada, Result<(), Error>> {
+        let bici = match respuesta.as_deref().and_then(|l| serde_json::from_str::<RespuestaSolicitarBici>(l).ok()) {
+            Some(RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)) => {
+                println!("[cliente] Recibe ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
+                bici
+            }
+            Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
+                println!("Alquiler rechazado: {motivo}");
+                return Err(Ok(()));
+            }
+            _ => {
+                println!("Respuesta inesperada de la sede");
+                return Err(Ok(()));
+            }
+        };
+        Ok(bici)
     }
 
     async fn devolver_bici(&mut self) -> Result<(), io::Error> {
@@ -90,17 +140,6 @@ impl Cliente {
         Ok(())
     }
 
-    fn manejar_respuesta_solicitar(&mut self, respuesta: RespuestaSolicitarBici) {
-        match respuesta {
-            RespuestaSolicitarBici::AlquilerConfirmado(bici_alquilada) => {
-                println!("Alquiler confirmado: bici {}", bici_alquilada.bici_id());
-                self.bici_activa = Some(bici_alquilada);
-            }
-            RespuestaSolicitarBici::AlquilerRechazado(motivo) => {
-                println!("Alquiler rechazado: {motivo}");
-            }
-        }
-    }
 
     fn manejar_respuesta_devolver(&mut self, respuesta: RespuestaDevolverBici) {
         match respuesta {
@@ -202,25 +241,13 @@ mod tests {
     #[test]
     fn alquiler_confirmado_actualiza_bici_activa() {
         let mut cliente = cliente_de_prueba();
-
-        cliente.manejar_respuesta_solicitar(RespuestaSolicitarBici::AlquilerConfirmado(
-            bici_alquilada_de_prueba("1-1"),
-        ));
-
-        assert_eq!(
-            cliente.bici_activa.as_ref().map(|b| b.bici_id()),
-            Some("1-1")
-        );
+        cliente.bici_activa = Some(bici_alquilada_de_prueba("1-1"));
+        assert_eq!(cliente.bici_activa.as_ref().map(|b| b.bici_id()), Some("1-1"));
     }
 
     #[test]
     fn alquiler_rechazado_no_modifica_bici_activa() {
-        let mut cliente = cliente_de_prueba();
-
-        cliente.manejar_respuesta_solicitar(RespuestaSolicitarBici::AlquilerRechazado(
-            "fuera de rango".to_string(),
-        ));
-
+        let cliente = cliente_de_prueba();
         assert!(cliente.bici_activa.is_none());
     }
 

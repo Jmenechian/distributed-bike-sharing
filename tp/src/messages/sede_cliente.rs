@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use crate::types::{Bici, BiciAlquilada};
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum RespuestaSolicitarBici {
+    ComprobanteAlquilerEmitido(BiciAlquilada),
     AlquilerConfirmado(BiciAlquilada),
-    AlquilerRechazado(String)
+    AlquilerRechazado(String),
 }
 
 #[derive(Serialize, Deserialize)]
