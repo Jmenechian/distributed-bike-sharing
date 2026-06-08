@@ -33,6 +33,47 @@ impl Sede {
 
         ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
+
+    async fn generar_respuesta(slots: Vec<Addr<Slot>>, sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], idx: usize, bici_id: String) -> RespuestaSolicitarBici {
+        let _ = slots[idx].send(Confirmar).await;
+
+        let alquiler_id = Uuid::new_v4().to_string();
+        let inicio_ts = timestamp_actual();
+
+        let payload = PayloadToken {
+            bici_id: bici_id.clone(),
+            alquiler_id: alquiler_id.clone(),
+            cliente_id: cliente_id.to_string(),
+            sede_origen_id: sede_id,
+            inicio_ts,
+        };
+        let token_alquiler = token::generar_token(&payload, &token_secret);
+
+        RespuestaSolicitarBici::AlquilerConfirmado(BiciAlquilada::new(
+            bici_id,
+            alquiler_id,
+            cliente_id.to_string(),
+            sede_id,
+            inicio_ts,
+            token_alquiler,
+        ))
+    }
+
+    async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
+        let mut bici_ganadora: Option<(usize, String)> = None;
+        for (idx, slot) in slots.iter().enumerate() {
+            match slot.send(Reservar).await {
+                Ok(ResultadoReserva::Reservada(bici_id)) => {
+                    bici_ganadora = Some((idx, bici_id));
+                    break;
+                }
+                Ok(ResultadoReserva::Rechazada) => continue,
+                Err(_) => continue,
+            }
+        }
+
+        bici_ganadora
+    }
 }
 
 impl Actor for Sede {
@@ -47,9 +88,7 @@ impl Handler<SolicitarBici> for Sede {
 
         if !self.cliente_en_rango(msg.coords) {
             return Box::pin(async move {
-                RespuestaSolicitarBici::AlquilerRechazado(String::from(
-                    "Para poder tomar la bici debe estar mas cerca de la sede",
-                ))
+                RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede"))
             });
         }
 
@@ -59,47 +98,11 @@ impl Handler<SolicitarBici> for Sede {
         let token_secret = self.token_secret;
 
         Box::pin(async move {
-            let mut bici_ganadora: Option<(usize, String)> = None;
-
-            for (idx, slot) in slots.iter().enumerate() {
-                match slot.send(Reservar).await {
-                    Ok(ResultadoReserva::Reservada(bici_id)) => {
-                        bici_ganadora = Some((idx, bici_id));
-                        break;
-                    }
-                    Ok(ResultadoReserva::Rechazada) => continue,
-                    Err(_) => continue,
-                }
-            }
+            let bici_ganadora: Option<(usize, String)> = Self::reservar_bici(&slots).await;
 
             match bici_ganadora {
-                Some((idx, bici_id)) => {
-                    let _ = slots[idx].send(Confirmar).await;
-
-                    let alquiler_id = Uuid::new_v4().to_string();
-                    let inicio_ts = timestamp_actual();
-
-                    let payload = PayloadToken {
-                        bici_id: bici_id.clone(),
-                        alquiler_id: alquiler_id.clone(),
-                        cliente_id: cliente_id.to_string(),
-                        sede_origen_id: sede_id,
-                        inicio_ts,
-                    };
-                    let token_alquiler = token::generar_token(&payload, &token_secret);
-
-                    RespuestaSolicitarBici::AlquilerConfirmado(BiciAlquilada::new(
-                        bici_id,
-                        alquiler_id,
-                        cliente_id.to_string(),
-                        sede_id,
-                        inicio_ts,
-                        token_alquiler,
-                    ))
-                }
-                None => RespuestaSolicitarBici::AlquilerRechazado(String::from(
-                    "No hay bicicletas disponibles en este momento",
-                )),
+                Some((idx, bici_id)) => { Self::generar_respuesta(slots, sede_id, cliente_id, &token_secret, idx, bici_id).await }
+                None => RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento")),
             }
         })
     }
@@ -108,17 +111,12 @@ impl Handler<SolicitarBici> for Sede {
 impl Handler<DevolverBici> for Sede {
     type Result = ResponseFuture<RespuestaDevolverBici>;
 
-    // `msg.token_alquiler` is intentionally not run through `token::validar_token` here:
-    // same-Sede returns trust the in-memory rental record, and cross-Sede validation
-    // is reserved for a future change that needs the token's self-contained payload.
     fn handle(&mut self, msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
         println!("Chau Bici");
 
         if !self.cliente_en_rango(msg.coords) {
             return Box::pin(async move {
-                RespuestaDevolverBici::DevolucionRechazada(String::from(
-                    "Para poder devolver la bici debe estar mas cerca de la sede",
-                ))
+                RespuestaDevolverBici::DevolucionRechazada(String::from("Para poder devolver la bici debe estar mas cerca de la sede"))
             });
         }
 
@@ -127,18 +125,13 @@ impl Handler<DevolverBici> for Sede {
 
         Box::pin(async move {
             for slot in slots.iter() {
-                match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await
-                {
-                    Ok(true) => {
-                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id });
-                    }
+                match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
+                    Ok(true) => { return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }); }
                     _ => continue,
                 }
             }
 
-            RespuestaDevolverBici::DevolucionRechazada(String::from(
-                "No hay lugar disponible para devolver la bici en este momento",
-            ))
+            RespuestaDevolverBici::DevolucionRechazada(String::from("No hay lugar disponible para devolver la bici en este momento"))
         })
     }
 }
