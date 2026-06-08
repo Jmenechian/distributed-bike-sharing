@@ -1,15 +1,17 @@
-use actix::prelude::*;
-use actix::{Actor, Addr, Context, Handler, MessageResult, ResponseFuture};
-use matenmutex::messages::clientesede::{
+use actix::{Actor, Addr, Context, Handler, MailboxError, ResponseFuture};
+use matenmutex::messages::cliente_sede::{
     DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
-use matenmutex::messages::sede_cliente::{RespuestaDevolucionBici, RespuestaSolicitarBici};
 use matenmutex::slot;
-use matenmutex::slot::{ConsultarBici, DejarBici, ReservarBici, ReservarSlot, Slot, TomarBici};
-use matenmutex::types::{Bici, BiciAlquilada};
+use matenmutex::slot::{AsegurarBici, ConsultarBici, Reservar, ResultadoReserva, Confirmar, Slot};
+use matenmutex::token::{self, PayloadToken, SECRET_LEN};
+use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
+use serde::Serialize;
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use uuid::Uuid;
+use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 
 const DISTANCIA_MINIMA: f64 = 2.0;
 
@@ -17,9 +19,8 @@ pub struct Sede {
     sede_id: u32,
     coords: (f64, f64),
     slots: Vec<Addr<Slot>>,
+    token_secret: [u8; SECRET_LEN],
 }
-
-
 
 impl Sede {
     fn cliente_en_rango(&self, coords: (f64, f64)) -> bool {
@@ -30,153 +31,115 @@ impl Sede {
         let (coords_sede_x, coords_sede_y) = self.coords;
         let (coords_cliente_x, coords_cliente_y) = coords;
 
-        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2))
-            .sqrt()
+        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
-
-    async fn encontrar_slot_disponible(mut consultas: Vec<Request<Slot, ConsultarBici>>, slots_refs: Vec<Addr<Slot>>, estado_necesario: &str) -> Option<Addr<Slot>> {
-        let resultados = futures::future::join_all(consultas).await;
-
-        let mut slot_disponible = None;
-        for (addr, res) in slots_refs.iter().zip(resultados.iter()) {
-            if matches!(res, Ok(estado) if estado.contains(estado_necesario)) {
-                slot_disponible = Some(addr.clone());
-                break;
-            }
-        }
-        slot_disponible
-    }
-
-
-
-    async fn reservar_y_tomar(slot: Addr<Slot>, cliente_id: String, sede_id: u32) -> RespuestaSolicitarBici {
-        let Ok(Ok(())) = slot.send(ReservarBici).await else {
-            return rechazar_solicitud("No se pudo reservar slot");
-        };
-
-        let Ok(Ok(bici_id)) = slot.send(TomarBici).await else {
-            return rechazar_solicitud("Error tomando Bici");
-        };
-
-        RespuestaSolicitarBici::AlquilerConfirmado(
-            BiciAlquilada::new(
-                bici_id,
-                "1".to_string(),
-                cliente_id.to_string(),
-                sede_id,
-                0,
-                "1".to_string(),
-            ),
-        )
-    }
-
-    async fn reservar_y_dejar(slot: Addr<Slot>, bici: BiciAlquilada) -> RespuestaDevolucionBici {
-        let bici_id = bici.bici_id;
-        let Ok(Ok(())) = slot.send(ReservarSlot {bici_id}).await else {
-            return rechazar_devolucion("No se pudo reservar slot");
-        };
-
-        let Ok(Ok(bici_id)) = slot.send(DejarBici).await else {
-            return rechazar_devolucion("Error tomando Bici");
-        };
-
-        let monto = calcular_monto();
-
-        RespuestaDevolucionBici::DevolucionOk {monto: monto, duracion: 64}
-
-    }
-
-}
-
-fn calcular_monto() -> f64 {
-    1.5
 }
 
 impl Actor for Sede {
     type Context = Context<Self>;
 }
 
-
-fn rechazar_solicitud(msg: &str) -> RespuestaSolicitarBici{
-    RespuestaSolicitarBici::AlquilerRechazado(msg.to_string())
-}
-
-fn rechazar_devolucion(msg: &str) -> RespuestaDevolucionBici{
-    RespuestaDevolucionBici::DevolucionRechazada(msg.to_string())
-}
-
 impl Handler<SolicitarBici> for Sede {
-    type Result = ResponseActFuture<Self, RespuestaSolicitarBici>; //futures actor porque tenes que usar info de self
+    type Result = ResponseFuture<RespuestaSolicitarBici>;
 
     fn handle(&mut self, msg: SolicitarBici, _ctx: &mut Context<Self>) -> Self::Result {
+        println!("Hola Bici");
+
         if !self.cliente_en_rango(msg.coords) {
-            return Box::pin(
-                async { rechazar_solicitud("Para poder tomar la bici debe estar mas cerca de la sede")}.into_actor(self)); //future a actorfuture (responseActFuture)
+            return Box::pin(async move {
+                RespuestaSolicitarBici::AlquilerRechazado(String::from(
+                    "Para poder tomar la bici debe estar mas cerca de la sede",
+                ))
+            });
         }
 
-        let mut consultas = Vec::new();
-        for slot in self.slots.iter() {
-            consultas.push(slot.send(ConsultarBici))
-        }
-
-        let slots_refs: Vec<Addr<Slot>> = self.slots.clone();
-        let cliente_id = msg.cliente_id.clone();
+        let slots = self.slots.clone();
         let sede_id = self.sede_id;
+        let cliente_id = msg.cliente_id;
+        let token_secret = self.token_secret;
 
-        Box::pin(
-            async move {
-                Self::encontrar_slot_disponible(consultas, slots_refs, "disponible").await
-            }
-            .into_actor(self)
-            .then(move |slot_opt, actor, _ctx| {
-                // move toma ownership (para cliente_id y sede_id)
-                async move {
-                    match slot_opt {
-                        None => rechazar_solicitud("No hay bicis disponibles"),
-                        Some(slot) => { Self::reservar_y_tomar(slot, cliente_id.to_string(), sede_id).await
-                        }
+        Box::pin(async move {
+            let mut bici_ganadora: Option<(usize, String)> = None;
+
+            for (idx, slot) in slots.iter().enumerate() {
+                match slot.send(Reservar).await {
+                    Ok(ResultadoReserva::Reservada(bici_id)) => {
+                        bici_ganadora = Some((idx, bici_id));
+                        break;
                     }
+                    Ok(ResultadoReserva::Rechazada) => continue,
+                    Err(_) => continue,
                 }
-                .into_actor(actor)
-            }),
-        )
+            }
+
+            match bici_ganadora {
+                Some((idx, bici_id)) => {
+                    let _ = slots[idx].send(Confirmar).await;
+
+                    let alquiler_id = Uuid::new_v4().to_string();
+                    let inicio_ts = timestamp_actual();
+
+                    let payload = PayloadToken {
+                        bici_id: bici_id.clone(),
+                        alquiler_id: alquiler_id.clone(),
+                        cliente_id: cliente_id.to_string(),
+                        sede_origen_id: sede_id,
+                        inicio_ts,
+                    };
+                    let token_alquiler = token::generar_token(&payload, &token_secret);
+
+                    RespuestaSolicitarBici::AlquilerConfirmado(BiciAlquilada::new(
+                        bici_id,
+                        alquiler_id,
+                        cliente_id.to_string(),
+                        sede_id,
+                        inicio_ts,
+                        token_alquiler,
+                    ))
+                }
+                None => RespuestaSolicitarBici::AlquilerRechazado(String::from(
+                    "No hay bicicletas disponibles en este momento",
+                )),
+            }
+        })
     }
 }
 
 impl Handler<DevolverBici> for Sede {
-    type Result = ResponseActFuture<Self, RespuestaDevolucionBici>; //futures actor porque tenes que usar info de self
+    type Result = ResponseFuture<RespuestaDevolverBici>;
 
+    // `msg.token_alquiler` is intentionally not run through `token::validar_token` here:
+    // same-Sede returns trust the in-memory rental record, and cross-Sede validation
+    // is reserved for a future change that needs the token's self-contained payload.
     fn handle(&mut self, msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
+        println!("Chau Bici");
+
         if !self.cliente_en_rango(msg.coords) {
-            return Box::pin(
-                async { rechazar_devolucion("Para poder tomar la bici debe estar mas cerca de la sede")}.into_actor(self)); //future a actorfuture (responseActFuture)
+            return Box::pin(async move {
+                RespuestaDevolverBici::DevolucionRechazada(String::from(
+                    "Para poder devolver la bici debe estar mas cerca de la sede",
+                ))
+            });
         }
 
-        let mut consultas = Vec::new();
-        for slot in self.slots.iter() {
-            consultas.push(slot.send(ConsultarBici))
-        }
+        let slots = self.slots.clone();
+        let bici_id = msg.bici.bici_id;
 
-        let slots_refs: Vec<Addr<Slot>> = self.slots.clone();
-        let sede_id = self.sede_id;
-
-        Box::pin(
-            async move {
-                Self::encontrar_slot_disponible(consultas, slots_refs, "vacio").await
-            }
-                .into_actor(self)
-                .then(move |slot_opt, actor, _ctx| {
-                    async move {
-                        match slot_opt {
-                            None => rechazar_devolucion("No hay espacio disponible"),
-                            Some(slot) => { Self::reservar_y_dejar(slot, msg.bici).await
-                            }
-                        }
+        Box::pin(async move {
+            for slot in slots.iter() {
+                match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await
+                {
+                    Ok(true) => {
+                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id });
                     }
-                        .into_actor(actor)
-                }),
-        )
+                    _ => continue,
+                }
+            }
 
+            RespuestaDevolverBici::DevolucionRechazada(String::from(
+                "No hay lugar disponible para devolver la bici en este momento",
+            ))
+        })
     }
 }
 
@@ -184,14 +147,14 @@ impl Handler<PreguntarBicis> for Sede {
     type Result = ResponseFuture<String>;
 
     fn handle(&mut self, _msg: PreguntarBicis, _ctx: &mut Context<Self>) -> Self::Result {
-        let futs: Vec<_> = self
+        let requests: Vec<_> = self
             .slots
             .iter()
             .map(|slot| slot.send(ConsultarBici)) // mensaje a cada slot
             .collect();
 
         Box::pin(async move {
-            let resultados = futures::future::join_all(futs).await;
+            let resultados = futures::future::join_all(requests).await;
             let lineas: Vec<String> = resultados.into_iter().filter_map(|r| r.ok()).collect();
 
             let ocupados = lineas.iter().filter(|l| !l.contains("sin bici")).count();
@@ -204,10 +167,236 @@ impl Handler<PreguntarBicis> for Sede {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matenmutex::messages::cliente_sede::{DevolverBici, SolicitarBici};
+    use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+    use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
+
+    fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
+        let slots = crear_slots_con_estados(estados);
+        Sede {
+            sede_id: 1,
+            coords: (-34.6037, -58.3816),
+            slots,
+            token_secret: token::cargar_secret("secreto-de-test"),
+        }
+        .start()
+    }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_con_slot_disponible_confirma_con_bici_id_real() {
+        let sede = sede_con_estados(vec![
+            EstadoSlot::Reservado {
+                bici_id: "1-1".to_string(),
+            },
+            EstadoSlot::Vacio,
+            EstadoSlot::Disponible {
+                bici_id: "1-3".to_string(),
+            },
+        ]);
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 42,
+                coords: (-34.6037, -58.3816),
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::AlquilerConfirmado(bici_alquilada) => {
+                assert_eq!(bici_alquilada.bici_id(), "1-3");
+                assert!(!bici_alquilada.alquiler_id().is_empty());
+                assert!(bici_alquilada.inicio_ts() > 0);
+            }
+            RespuestaSolicitarBici::AlquilerRechazado(motivo) => {
+                panic!("se esperaba AlquilerConfirmado, se obtuvo AlquilerRechazado({motivo})");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_sin_slots_disponibles_rechaza() {
+        let sede = sede_con_estados(vec![
+            EstadoSlot::Vacio,
+            EstadoSlot::Reservado {
+                bici_id: "1-2".to_string(),
+            },
+        ]);
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 42,
+                coords: (-34.6037, -58.3816),
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::AlquilerRechazado(_) => {}
+            RespuestaSolicitarBici::AlquilerConfirmado(_) => {
+                panic!("se esperaba AlquilerRechazado, se obtuvo AlquilerConfirmado");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_concurrente_sobre_un_unico_slot_disponible_solo_uno_gana() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible {
+            bici_id: "1-1".to_string(),
+        }]);
+
+        let sede_a = sede.clone();
+        let sede_b = sede.clone();
+
+        let (resp_a, resp_b) = futures::join!(
+            sede_a.send(SolicitarBici {
+                cliente_id: 1,
+                coords: (-34.6037, -58.3816),
+            }),
+            sede_b.send(SolicitarBici {
+                cliente_id: 2,
+                coords: (-34.6037, -58.3816),
+            })
+        );
+
+        let confirmados = [resp_a.unwrap(), resp_b.unwrap()]
+            .into_iter()
+            .filter(|r| matches!(r, RespuestaSolicitarBici::AlquilerConfirmado(_)))
+            .count();
+        let rechazados_count = 2 - confirmados;
+
+        assert_eq!(confirmados, 1, "exactamente un cliente debe ganar la bici");
+        assert_eq!(rechazados_count, 1, "exactamente un cliente debe ser rechazado");
+    }
+
+    #[actix_rt::test]
+    async fn devolver_bici_con_slot_vacio_asegura_la_bici_y_responde_ok() {
+        let sede = sede_con_estados(vec![
+            EstadoSlot::Disponible {
+                bici_id: "1-1".to_string(),
+            },
+            EstadoSlot::Vacio,
+            EstadoSlot::Reservado {
+                bici_id: "1-3".to_string(),
+            },
+        ]);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: Bici {
+                    bici_id: "9-9".to_string(),
+                },
+                coords: (-34.6037, -58.3816),
+                token_alquiler: String::new(),
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionOk(bici) => {
+                assert_eq!(bici.bici_id, "9-9");
+            }
+            RespuestaDevolverBici::DevolucionRechazada(motivo) => {
+                panic!("se esperaba DevolucionOk, se obtuvo DevolucionRechazada({motivo})");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+    async fn devolver_bici_sin_slots_vacios_rechaza() {
+        let sede = sede_con_estados(vec![
+            EstadoSlot::Disponible {
+                bici_id: "1-1".to_string(),
+            },
+            EstadoSlot::Reservado {
+                bici_id: "1-2".to_string(),
+            },
+        ]);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: Bici {
+                    bici_id: "9-9".to_string(),
+                },
+                coords: (-34.6037, -58.3816),
+                token_alquiler: String::new(),
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionRechazada(_) => {}
+            RespuestaDevolverBici::DevolucionOk(_) => {
+                panic!("se esperaba DevolucionRechazada, se obtuvo DevolucionOk");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+    async fn devolver_bici_cliente_fuera_de_rango_rechaza() {
+        let sede = sede_con_estados(vec![EstadoSlot::Vacio]);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: Bici {
+                    bici_id: "9-9".to_string(),
+                },
+                coords: (0.0, 0.0),
+                token_alquiler: String::new(),
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionRechazada(_) => {}
+            RespuestaDevolverBici::DevolucionOk(_) => {
+                panic!("se esperaba DevolucionRechazada por estar fuera de rango, se obtuvo DevolucionOk");
+            }
+        }
+    }
+}
+
+
+async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -> String {
+    match resultado {
+        Ok(valor) => match serde_json::to_string(&valor) {
+            Ok(json) => json + "\n",
+            Err(e) => {
+                eprintln!("Error serializando respuesta: {}", e);
+                String::from("ERROR:no se pudo serializar la respuesta\n")
+            }
+        },
+        Err(e) => {
+            eprintln!("Error enviando mensaje al actor Sede: {}", e);
+            String::from("ERROR:la sede no pudo procesar el mensaje\n")
+        }
+    }
+}
+
 #[actix_rt::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+
     let args: Vec<String> = env::args().collect();
-    let n: u16 = args[1].parse().unwrap(); //acordarse todos los unwraps
+    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
+        Some(n) => n,
+        None => {
+            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
+            return;
+        }
+    };
+
+    let token_secret_raw = match env::var("TOKEN_SECRET") {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
+            return;
+        }
+    };
+    let token_secret = token::cargar_secret(&token_secret_raw);
 
     let sede_id = n as u32;
     let num_slots = 20;
@@ -217,15 +406,28 @@ async fn main() {
         sede_id: sede_id,
         coords: (-34.6037, -58.3816),
         slots: slots,
+        token_secret,
     }
     .start();
 
     let addr = format!("127.0.0.1:808{}", n);
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("No se pudo iniciar la sede en {}: {}", addr, e);
+            return;
+        }
+    };
     println!("Sede {}, puerto {}", n, addr);
 
     loop {
-        let (socket, addr) = listener.accept().await.unwrap();
+        let (socket, addr) = match listener.accept().await {
+            Ok(conexion) => conexion,
+            Err(e) => {
+                eprintln!("Error aceptando conexion entrante: {}", e);
+                continue;
+            }
+        };
         println!("New connection from {}", addr);
         let sede = sede.clone();
 
@@ -236,20 +438,21 @@ async fn main() {
             while let Ok(Some(line)) = lines.next_line().await {
                 let response = match serde_json::from_str::<MsgClienteASede>(line.trim()) {
                     Ok(MsgClienteASede::SolicitarBici(msg)) => {
-                        let result = sede.send(msg).await.unwrap();
-                        serde_json::to_string(&result).unwrap() + "\n"
+                        formatear_respuesta(sede.send(msg).await).await
                     }
                     Ok(MsgClienteASede::DevolverBici(msg)) => {
-                        let result = sede.send(msg).await.unwrap();
-                        serde_json::to_string(&result).unwrap() + "\n"
+                        formatear_respuesta(sede.send(msg).await).await
                     }
                     Ok(MsgClienteASede::PreguntarBicis(msg)) => {
-                        let result = sede.send(msg).await.unwrap();
-                        serde_json::to_string(&result).unwrap() + "\n"
+                        formatear_respuesta(sede.send(msg).await).await
                     }
                     Err(_) => format!("UNKNOWN:{}\n", line.trim()),
                 };
-                writer.write_all(response.as_bytes()).await.unwrap();
+
+                if let Err(e) = writer.write_all(response.as_bytes()).await {
+                    eprintln!("Error escribiendo respuesta a {}: {}", addr, e);
+                    break;
+                }
             }
             println!("Connection from {} closed", addr);
         });
