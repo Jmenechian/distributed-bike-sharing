@@ -121,7 +121,7 @@ impl Handler<DevolverBici> for Sede {
         }
 
         let slots = self.slots.clone();
-        let bici_id = msg.bici.bici_id;
+        let bici_id = msg.bici.bici_id().to_string();
 
         Box::pin(async move {
             for slot in slots.iter() {
@@ -279,11 +279,8 @@ mod tests {
 
         let respuesta = sede
             .send(DevolverBici {
-                bici: Bici {
-                    bici_id: "9-9".to_string(),
-                },
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (-34.6037, -58.3816),
-                token_alquiler: String::new(),
             })
             .await
             .unwrap();
@@ -311,11 +308,8 @@ mod tests {
 
         let respuesta = sede
             .send(DevolverBici {
-                bici: Bici {
-                    bici_id: "9-9".to_string(),
-                },
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (-34.6037, -58.3816),
-                token_alquiler: String::new(),
             })
             .await
             .unwrap();
@@ -334,11 +328,8 @@ mod tests {
 
         let respuesta = sede
             .send(DevolverBici {
-                bici: Bici {
-                    bici_id: "9-9".to_string(),
-                },
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (0.0, 0.0),
-                token_alquiler: String::new(),
             })
             .await
             .unwrap();

@@ -3,7 +3,7 @@ use matenmutex::messages::cliente_sede::{
     DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::types::{Bici, BiciAlquilada};
+use matenmutex::types::BiciAlquilada;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
@@ -59,24 +59,16 @@ impl Cliente {
         Ok(())
     }
 
-    async fn devolver_bici(&mut self, bici_id: &str, x: f64, y: f64) -> Result<(), io::Error> {
-        let token_alquiler = match &self.bici_activa {
-            Some(bici_alquilada) => bici_alquilada.token_alquiler().to_string(),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "No hay un alquiler activo para devolver",
-                ));
-            }
-        };
+    async fn devolver_bici(&mut self) -> Result<(), io::Error> {
+        if self.bici_activa.is_none() {
+            println!("Primero conseguite una bici");
+            return Ok(());
+        }
+
+        let bici = self.bici_activa.take().unwrap();
+        let coords = self.coords;
         let (writer, reader) = self.validar_conexion()?;
-        let msg = MsgClienteASede::DevolverBici(DevolverBici {
-            bici: Bici {
-                bici_id: bici_id.to_string(),
-            },
-            coords: (x, y),
-            token_alquiler,
-        });
+        let msg = MsgClienteASede::DevolverBici(DevolverBici { bici, coords });
         let linea = enviar_mensaje_a_sede(writer, reader, msg).await?;
 
         if let Some(linea) = linea {
@@ -156,7 +148,7 @@ async fn main() {
     let mut cliente = Cliente::new(42, (-34.6037, -58.3816));
 
     println!(
-        "Comandos: 'conectar_sede <n>' | 'solicitar_bici' | 'devolver_bici <bici_id> <x> <y>' | 'info_bicis' | 'quit'"
+        "Comandos: 'conectar_sede <n>' | 'solicitar_bici' | 'devolver_bici' | 'info_bicis' | 'quit'"
     );
 
     let stdin = tokio::io::stdin();
@@ -169,13 +161,7 @@ async fn main() {
         let result = match parts.as_slice() {
             ["conectar_sede", n] => cliente.conectar(n).await,
             ["solicitar_bici"] => cliente.solicitar_bici().await,
-            ["devolver_bici", bici_id, x, y] => match (x.parse::<f64>(), y.parse::<f64>()) {
-                (Ok(x), Ok(y)) => cliente.devolver_bici(bici_id, x, y).await,
-                _ => {
-                    println!("Coordenadas inválidas");
-                    continue;
-                }
-            },
+            ["devolver_bici"] => cliente.devolver_bici().await,
             ["info_bicis"] => cliente.info_bicis().await,
             ["quit"] => {
                 println!("Bye!");
@@ -196,6 +182,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matenmutex::types::Bici;
 
     fn cliente_de_prueba() -> Cliente {
         Cliente::new(1, (-34.6037, -58.3816))

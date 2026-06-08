@@ -1,7 +1,7 @@
 use actix::Message;
 use serde::{Deserialize, Serialize};
 use crate::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use crate::types::Bici;
+use crate::types::BiciAlquilada;
 
 #[derive(Serialize, Deserialize)]
 pub struct SolicitarBici {
@@ -11,9 +11,8 @@ pub struct SolicitarBici {
 
 #[derive(Serialize, Deserialize)]
 pub struct DevolverBici {
-    pub bici: Bici,
+    pub bici: BiciAlquilada,
     pub coords: (f64, f64),
-    pub token_alquiler: String,
 }
 
 #[derive(Serialize, Deserialize)]
