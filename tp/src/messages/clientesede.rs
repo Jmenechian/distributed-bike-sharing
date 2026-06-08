@@ -1,5 +1,5 @@
-use crate::messages::sede_cliente::RespuestaSolicitarBici;
-use crate::types::Bici;
+use crate::messages::sede_cliente::{RespuestaDevolucionBici, RespuestaSolicitarBici};
+use crate::types::{Bici, BiciAlquilada};
 use actix::Message;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,7 @@ pub struct SolicitarBici {
 
 #[derive(Serialize, Deserialize)]
 pub struct DevolverBici {
-    pub bici: Bici,
+    pub bici: BiciAlquilada,
     pub coords: (f64, f64),
 }
 
@@ -31,7 +31,7 @@ impl Message for SolicitarBici {
 }
 
 impl Message for DevolverBici {
-    type Result = Option<Bici>;
+    type Result = RespuestaDevolucionBici;
 }
 
 impl Message for PreguntarBicis {

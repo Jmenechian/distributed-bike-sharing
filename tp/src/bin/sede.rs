@@ -3,9 +3,9 @@ use actix::{Actor, Addr, Context, Handler, MessageResult, ResponseFuture};
 use matenmutex::messages::clientesede::{
     DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
-use matenmutex::messages::sede_cliente::RespuestaSolicitarBici;
+use matenmutex::messages::sede_cliente::{RespuestaDevolucionBici, RespuestaSolicitarBici};
 use matenmutex::slot;
-use matenmutex::slot::{ConsultarBici, ReservarBici, Slot, TomarBici};
+use matenmutex::slot::{ConsultarBici, DejarBici, ReservarBici, ReservarSlot, Slot, TomarBici};
 use matenmutex::types::{Bici, BiciAlquilada};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,6 +19,8 @@ pub struct Sede {
     slots: Vec<Addr<Slot>>,
 }
 
+
+
 impl Sede {
     fn cliente_en_rango(&self, coords: (f64, f64)) -> bool {
         self.calcular_distancia(coords) <= DISTANCIA_MINIMA
@@ -31,10 +33,76 @@ impl Sede {
         ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2))
             .sqrt()
     }
+
+    async fn encontrar_slot_disponible(mut consultas: Vec<Request<Slot, ConsultarBici>>, slots_refs: Vec<Addr<Slot>>, estado_necesario: &str) -> Option<Addr<Slot>> {
+        let resultados = futures::future::join_all(consultas).await;
+
+        let mut slot_disponible = None;
+        for (addr, res) in slots_refs.iter().zip(resultados.iter()) {
+            if matches!(res, Ok(estado) if estado.contains(estado_necesario)) {
+                slot_disponible = Some(addr.clone());
+                break;
+            }
+        }
+        slot_disponible
+    }
+
+
+
+    async fn reservar_y_tomar(slot: Addr<Slot>, cliente_id: String, sede_id: u32) -> RespuestaSolicitarBici {
+        let Ok(Ok(())) = slot.send(ReservarBici).await else {
+            return rechazar_solicitud("No se pudo reservar slot");
+        };
+
+        let Ok(Ok(bici_id)) = slot.send(TomarBici).await else {
+            return rechazar_solicitud("Error tomando Bici");
+        };
+
+        RespuestaSolicitarBici::AlquilerConfirmado(
+            BiciAlquilada::new(
+                bici_id,
+                "1".to_string(),
+                cliente_id.to_string(),
+                sede_id,
+                0,
+                "1".to_string(),
+            ),
+        )
+    }
+
+    async fn reservar_y_dejar(slot: Addr<Slot>, bici: BiciAlquilada) -> RespuestaDevolucionBici {
+        let bici_id = bici.bici_id;
+        let Ok(Ok(())) = slot.send(ReservarSlot {bici_id}).await else {
+            return rechazar_devolucion("No se pudo reservar slot");
+        };
+
+        let Ok(Ok(bici_id)) = slot.send(DejarBici).await else {
+            return rechazar_devolucion("Error tomando Bici");
+        };
+
+        let monto = calcular_monto();
+
+        RespuestaDevolucionBici::DevolucionOk {monto: monto, duracion: 64}
+
+    }
+
+}
+
+fn calcular_monto() -> f64 {
+    1.5
 }
 
 impl Actor for Sede {
     type Context = Context<Self>;
+}
+
+
+fn rechazar_solicitud(msg: &str) -> RespuestaSolicitarBici{
+    RespuestaSolicitarBici::AlquilerRechazado(msg.to_string())
+}
+
+fn rechazar_devolucion(msg: &str) -> RespuestaDevolucionBici{
+    RespuestaDevolucionBici::DevolucionRechazada(msg.to_string())
 }
 
 impl Handler<SolicitarBici> for Sede {
@@ -43,14 +111,7 @@ impl Handler<SolicitarBici> for Sede {
     fn handle(&mut self, msg: SolicitarBici, _ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
             return Box::pin(
-                async {
-                    //wrapper future
-                    RespuestaSolicitarBici::AlquilerRechazado(
-                        "Para poder tomar la bici debe estar mas cerca de la sede".to_string(),
-                    )
-                }
-                .into_actor(self),
-            ); //future a actorfuture (responseActFuture)
+                async { rechazar_solicitud("Para poder tomar la bici debe estar mas cerca de la sede")}.into_actor(self)); //future a actorfuture (responseActFuture)
         }
 
         let mut consultas = Vec::new();
@@ -64,56 +125,15 @@ impl Handler<SolicitarBici> for Sede {
 
         Box::pin(
             async move {
-                let resultados = futures::future::join_all(consultas).await;
-
-                let mut slot_disponible = None;
-                for (addr, res) in slots_refs.iter().zip(resultados.iter()) {
-                    if matches!(res, Ok(estado) if estado.contains("disponible")) {
-                        slot_disponible = Some(addr.clone());
-                        break;
-                    }
-                }
-                slot_disponible
+                Self::encontrar_slot_disponible(consultas, slots_refs, "disponible").await
             }
             .into_actor(self)
             .then(move |slot_opt, actor, _ctx| {
                 // move toma ownership (para cliente_id y sede_id)
                 async move {
                     match slot_opt {
-                        None => RespuestaSolicitarBici::AlquilerRechazado(
-                            // no hay bicis disponibles
-                            "No hay bicis disponibles".to_string(),
-                        ),
-                        Some(slot) => {
-                            // 2. Reservar el slot
-                            let reserva = slot.send(ReservarBici).await;
-
-                            match reserva {
-                                Ok(Ok(())) => {
-                                    let toma = slot.send(TomarBici).await;
-                                    match toma {
-                                        Ok(Ok(bici_id)) => {
-                                            RespuestaSolicitarBici::AlquilerConfirmado(
-                                                BiciAlquilada::new(
-                                                    bici_id,
-                                                    "1".to_string(),
-                                                    cliente_id.to_string(),
-                                                    sede_id,
-                                                    0,
-                                                    "1".to_string(),
-                                                ),
-                                            )
-                                        }
-                                        _ => RespuestaSolicitarBici::AlquilerRechazado( //vemos si quedan o se van
-                                            "Error al tomar la bici".to_string(),
-                                        ),
-                                    }
-                                }
-                                _ => RespuestaSolicitarBici::AlquilerRechazado(
-                                    //race condition?
-                                    "No se pudo reservar el slot".to_string(),
-                                ),
-                            }
+                        None => rechazar_solicitud("No hay bicis disponibles"),
+                        Some(slot) => { Self::reservar_y_tomar(slot, cliente_id.to_string(), sede_id).await
                         }
                     }
                 }
@@ -124,14 +144,39 @@ impl Handler<SolicitarBici> for Sede {
 }
 
 impl Handler<DevolverBici> for Sede {
-    type Result = Option<Bici>;
+    type Result = ResponseActFuture<Self, RespuestaDevolucionBici>; //futures actor porque tenes que usar info de self
 
-    fn handle(&mut self, _msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
-        println!("Chau Bici");
+    fn handle(&mut self, msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
+        if !self.cliente_en_rango(msg.coords) {
+            return Box::pin(
+                async { rechazar_devolucion("Para poder tomar la bici debe estar mas cerca de la sede")}.into_actor(self)); //future a actorfuture (responseActFuture)
+        }
 
-        Some(Bici {
-            bici_id: "Hola".parse().unwrap(),
-        })
+        let mut consultas = Vec::new();
+        for slot in self.slots.iter() {
+            consultas.push(slot.send(ConsultarBici))
+        }
+
+        let slots_refs: Vec<Addr<Slot>> = self.slots.clone();
+        let sede_id = self.sede_id;
+
+        Box::pin(
+            async move {
+                Self::encontrar_slot_disponible(consultas, slots_refs, "vacio").await
+            }
+                .into_actor(self)
+                .then(move |slot_opt, actor, _ctx| {
+                    async move {
+                        match slot_opt {
+                            None => rechazar_devolucion("No hay espacio disponible"),
+                            Some(slot) => { Self::reservar_y_dejar(slot, msg.bici).await
+                            }
+                        }
+                    }
+                        .into_actor(actor)
+                }),
+        )
+
     }
 }
 

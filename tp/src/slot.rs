@@ -40,9 +40,9 @@ impl Handler<ConsultarBici> for Slot {
 
     fn handle(&mut self, _msg: ConsultarBici, _ctx: &mut Context<Self>) -> Self::Result {
         match &self.estado {
-            EstadoSlot::Disponible { bici_id } => format!("Slot {}: (disponible)", self.slot_id),
-            EstadoSlot::Reservado { bici_id } => format!("Slot {}: (reservado)", self.slot_id),
-            EstadoSlot::Vacio => format!("Slot {}: sin bici", self.slot_id),
+            EstadoSlot::Disponible { bici_id } => format!("Slot {}: disponible", self.slot_id),
+            EstadoSlot::Reservado { bici_id } => format!("Slot {}: reservado", self.slot_id),
+            EstadoSlot::Vacio => format!("Slot {}: Vacio", self.slot_id),
         }
     }
 }
@@ -67,6 +67,29 @@ impl Handler<ReservarBici> for Slot {
     }
 }
 
+pub struct ReservarSlot {
+    pub bici_id: String,
+}
+
+impl Message for ReservarSlot {
+    type Result = Result<(), String>;
+}
+
+impl Handler<ReservarSlot> for Slot {
+    type Result = Result<(), String>;
+    fn handle(&mut self, msg: ReservarSlot, _ctx: &mut Context<Self>) -> Self::Result {
+        match &self.estado {
+            EstadoSlot::Vacio {} => {
+                let bici_id = msg.bici_id;
+                self.estado = EstadoSlot::Reservado { bici_id };
+                Ok(())
+            }
+            _ => Err("Slot no disponible".to_string()), //tal vez no hace falta
+        }
+    }
+}
+
+
 pub struct TomarBici;
 
 impl Message for TomarBici {
@@ -82,6 +105,27 @@ impl Handler<TomarBici> for Slot {
                 let bici_id = bici_id.clone();
                 self.estado = EstadoSlot::Vacio;
                 Ok(bici_id.clone())
+            }
+            _ => Err(0),
+        }
+    }
+}
+
+pub struct DejarBici;
+
+impl Message for DejarBici {
+    type Result = Result<(), u32>;
+}
+
+impl Handler<DejarBici> for Slot {
+    type Result = Result<(), u32>;
+
+    fn handle(&mut self, _msg: DejarBici, _ctx: &mut Context<Self>) -> Self::Result {
+        match &self.estado {
+            EstadoSlot::Reservado { bici_id } => {
+                let bici_id = bici_id.clone();
+                self.estado = EstadoSlot::Disponible { bici_id };
+                Ok(())
             }
             _ => Err(0),
         }

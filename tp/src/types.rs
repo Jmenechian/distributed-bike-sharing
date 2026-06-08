@@ -7,7 +7,7 @@ pub struct Bici {
 
 #[derive(Serialize, Deserialize)]
 pub struct BiciAlquilada {
-    bici_id: String,
+    pub bici_id: String,
     alquiler_id: String,
     cliente_id: String,
     sede_origen_id: u32,
