@@ -8,11 +8,17 @@ use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
 use serde::Serialize;
 use std::env;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::RwLock;
+use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::utils::{DISTANCIA_MINIMA, PREMONTO, TASA};
+use matenmutex::messages::sedes::{Heartbeat, MsgSedeASede, SedeInfo, crear_info_dummy};
+use matenmutex::utils::{DISTANCIA_MINIMA, PREMONTO, PUERTO_BASE, TASA};
 
 pub struct Sede {
     sede_id: u32,
@@ -20,6 +26,18 @@ pub struct Sede {
     slots: Vec<Addr<Slot>>,
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
+    sedes_conocidas: Vec<SedeInfo>,
+    mi_info: Arc<RwLock<SedeInfo>>,
+}
+
+
+
+fn id_de_addr(addr: &SocketAddr) -> u32 {
+    (addr.port() - PUERTO_BASE) as u32
+}
+
+fn addr_de_id(id: u32, ip: IpAddr) -> SocketAddr {
+    SocketAddr::new(ip, PUERTO_BASE + id as u16)
 }
 
 impl Sede {
@@ -97,6 +115,7 @@ impl Handler<SolicitarBici> for Sede {
         let token_secret = self.token_secret;
         let sede_addr = ctx.address();
 
+        let mi_info = self.mi_info.clone();
         Box::pin(async move {
             match Self::reservar_bici(&slots).await {
                 None => {
@@ -112,6 +131,8 @@ impl Handler<SolicitarBici> for Sede {
                         Ok(bici) => {
                             println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                             let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
+                            mi_info.write().await.slots_disponibles -= 1;
+                            mi_info.write().await.ultimo_update_ts = timestamp_actual();
                             dinero -= PREMONTO;
                             RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                         }
@@ -213,6 +234,7 @@ impl Handler<PreguntarBicis> for Sede {
     type Result = ResponseFuture<String>;
 
     fn handle(&mut self, _msg: PreguntarBicis, _ctx: &mut Context<Self>) -> Self::Result {
+
         let requests: Vec<_> = self
             .slots
             .iter()
@@ -233,6 +255,15 @@ impl Handler<PreguntarBicis> for Sede {
     }
 }
 
+impl Handler<Heartbeat> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
+        println!("[sede] Sede Recibe Heartbeat de {}", msg.sede_id);
+
+        println!("{:?}", msg.info);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +272,7 @@ mod tests {
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
+        let dummy_info = crear_info_dummy();
         let slots = crear_slots_con_estados(estados);
         Sede {
             sede_id: 1,
@@ -248,6 +280,8 @@ mod tests {
             slots,
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
+            sedes_conocidas: vec![],
+            mi_info: Arc::new(RwLock::from(dummy_info)),
         }
         .start()
     }
@@ -467,48 +501,127 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let args: Vec<String> = env::args().collect();
-    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
-        Some(n) => n,
-        None => {
-            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
-            return;
-        }
+    let n = match numero_de_sede(args) {
+        Some(sede) => sede,
+        None => return,
     };
 
-    let token_secret_raw = match env::var("TOKEN_SECRET") {
-        Ok(raw) => raw,
-        Err(_) => {
-            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
-            return;
-        }
+    let token_secret = match cargar_token_secret() {
+        Some(token) => token,
+        None => return,
     };
-    let token_secret = token::cargar_secret(&token_secret_raw);
 
     let sede_id = n as u32;
     let num_slots = 20;
     let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
+    let coords = (-34.6037, -58.3816); //ver dps cambiar coords json?
 
+    let mi_info = crear_sede_info(n, sede_id, coords);
+
+    let sede = crear_sede(token_secret, sede_id, slots, coords, mi_info.clone());
+
+    let public_addr = format!("127.0.0.1:808{}", n);
+    let private_addr = format!("127.0.0.1:700{}", n);
+
+    let public_listener = TcpListener::bind(&public_addr).await.unwrap();
+    let udp = Arc::new(UdpSocket::bind(&private_addr).await.unwrap());
+
+    println!("Sede {} — publica: {}, interna: {}", n, public_addr, private_addr);
+
+    // receiver
+    let udp_rx = udp.clone();
+    let sede_rx = sede.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let (len, peer) = match udp_rx.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => { eprintln!("UDP recv error: {}", e); continue; }
+            };
+            match serde_json::from_slice::<MsgSedeASede>(&buf[..len]) {
+                Ok(MsgSedeASede::Heartbeat(msg)) => {
+                    sede_rx.send(msg).await.ok();
+                }
+                Err(e) => eprintln!("UDP parse error from {}: {}", peer, e),
+            }
+        }
+    });
+
+    // sender
+    let udp_tx = udp.clone();
+    let sede_info_tx = mi_info.clone();
+    let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect();
+    tokio::spawn(async move {
+        loop {
+            let heartbeat = {
+                let info = sede_info_tx.read().await;
+                serde_json::to_vec(&MsgSedeASede::Heartbeat(Heartbeat { sede_id, info: info.clone() })).unwrap()
+            };
+            for s in &other_sedes {
+                let addr = format!("127.0.0.1:700{}", s); // was missing
+                udp_tx.send_to(&heartbeat, &addr).await.ok();
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await; // not sleep(2s)
+        }
+    });
+
+    loop_pub(sede, public_listener).await;
+}
+
+fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> Arc<RwLock<SedeInfo>> {
+    let mi_info = Arc::new(RwLock::new(SedeInfo {
+        sede_id,
+        coords,
+        public_addr: format!("127.0.0.1:808{}", n),
+        private_addr: format!("127.0.0.1:700{}", n),
+        slots_vacios: 99,
+        slots_disponibles: 99,
+        conectada: true,
+        ultimo_update_ts: timestamp_actual(),
+    }));
+    mi_info
+}
+
+fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), mi_info: Arc<RwLock<SedeInfo>>) -> Addr<Sede> {
     let sede = Sede {
         sede_id: sede_id,
-        coords: (-34.6037, -58.3816),
+        coords: coords,
         slots: slots,
         token_secret,
         pending_reservas: std::collections::HashMap::new(),
+        sedes_conocidas: vec![],
+        mi_info,
     }
-    .start();
+        .start();
+    sede
+}
 
-    let addr = format!("127.0.0.1:808{}", n);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("No se pudo iniciar la sede en {}: {}", addr, e);
-            return;
+fn cargar_token_secret() -> Option<[u8; 32]> {
+    let token_secret_raw = match env::var("TOKEN_SECRET") {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
+            return None;
         }
     };
-    println!("Sede {}, puerto {}", n, addr);
+    let token_secret = token::cargar_secret(&token_secret_raw);
+    Some(token_secret)
+}
 
+fn numero_de_sede(args: Vec<String>) -> Option<u16> {
+    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
+        Some(n) => n,
+        None => {
+            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
+            return None;
+        }
+    };
+    Some(n)
+}
+
+async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
     loop {
-        let (socket, addr) = match listener.accept().await {
+        let (socket, addr) = match public_listener.accept().await {
             Ok(conexion) => conexion,
             Err(e) => {
                 eprintln!("Error aceptando conexion entrante: {}", e);
@@ -548,3 +661,5 @@ async fn main() {
         });
     }
 }
+
+
