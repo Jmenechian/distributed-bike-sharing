@@ -87,7 +87,8 @@ impl Handler<SolicitarBici> for Sede {
         }
 
         if !self.cliente_tiene_dinero_solicitar(msg.dinero) {
-            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe tener mas dinero (Minimo $150)")) });
+            let msg = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${})", PREMONTO);
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from(msg)) });
         }
 
         let slots = self.slots.clone();
