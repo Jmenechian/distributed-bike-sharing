@@ -5,7 +5,6 @@ use matenmutex::messages::cliente_sede::{
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
 use std::io;
-use std::io::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -49,25 +48,22 @@ impl Cliente {
         let (writer, reader) = self.validar_conexion()?;
 
         let respuesta = Self::enviar_solicitar_bici(cliente_id, coords, writer, reader).await?;
-        let bici = match Self::descifrar_respuesta_de_solicitar_bici(respuesta) {
-            Ok(value) => value,
-            Err(value) => return value,
-        };
+        let bici = Self::descifrar_respuesta_de_solicitar_bici(respuesta)?;
 
         let respuesta = self.enviar_ack_comprobante(bici).await?;
         self.descifrar_respuesta_de_ack_comprobante(respuesta);
-        
+
         Ok(())
     }
 
-    async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, Error> {
+    async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
         let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords });
         println!("[cliente] Envia SolicitarBici");
         let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
         Ok(respuesta)
     }
 
-    async fn enviar_ack_comprobante(&mut self, bici: BiciAlquilada) -> Result<Option<String>, Error> {
+    async fn enviar_ack_comprobante(&mut self, bici: BiciAlquilada) -> Result<Option<String>, io::Error> {
         let alquiler_id = bici.alquiler_id().to_string();
         let (writer, reader) = self.validar_conexion()?;
         let ack = MsgClienteASede::AckComprobanteAlquiler(AckComprobanteAlquiler { alquiler_id: alquiler_id.clone() });
@@ -91,28 +87,20 @@ impl Cliente {
         }
     }
 
-    fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<BiciAlquilada, Result<(), Error>> {
-        let bici = match respuesta.as_deref().and_then(|l| serde_json::from_str::<RespuestaSolicitarBici>(l).ok()) {
+    fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<BiciAlquilada, io::Error> {
+        match respuesta.as_deref().and_then(|l| serde_json::from_str::<RespuestaSolicitarBici>(l).ok()) {
             Some(RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)) => {
                 println!("[cliente] Recibe ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
-                bici
+                Ok(bici)
             }
-            Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
-                println!("Alquiler rechazado: {motivo}");
-                return Err(Ok(()));
-            }
-            _ => {
-                println!("Respuesta inesperada de la sede");
-                return Err(Ok(()));
-            }
-        };
-        Ok(bici)
+            Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => { Err(io::Error::new(io::ErrorKind::Other, format!("Alquiler rechazado: {motivo}"))) }
+            _ => { Err(io::Error::new(io::ErrorKind::Other, "Respuesta inesperada de la sede")) }
+        }
     }
 
     async fn devolver_bici(&mut self) -> Result<(), io::Error> {
         if self.bici_activa.is_none() {
-            println!("Primero conseguite una bici");
-            return Ok(());
+            return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
 
         let bici = self.bici_activa.take().unwrap();

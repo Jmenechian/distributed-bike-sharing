@@ -22,22 +22,24 @@ pub enum TokenError {
     BloqueDemasiadoCorto,
     AutenticacionFallida,
     PayloadInvalido,
+    SerializacionFallida,
+    CifradoFallido,
 }
 
-pub fn generar_token(payload: &PayloadToken, secret: &[u8; SECRET_LEN]) -> String {
+pub fn generar_token(payload: &PayloadToken, secret: &[u8; SECRET_LEN]) -> Result<String, TokenError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(secret));
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
-    let plaintext = serde_json::to_vec(payload).expect("PayloadToken siempre serializa a JSON");
+    let plaintext = serde_json::to_vec(payload).map_err(|_| TokenError::SerializacionFallida)?;
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_ref())
-        .expect("el sellado AEAD con una clave de 32 bytes nunca falla");
+        .map_err(|_| TokenError::CifradoFallido)?;
 
     let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
 
-    base64::engine::general_purpose::STANDARD.encode(blob)
+    Ok(base64::engine::general_purpose::STANDARD.encode(blob))
 }
 
 pub fn validar_token(token: &str, secret: &[u8; SECRET_LEN]) -> Result<PayloadToken, TokenError> {
@@ -89,7 +91,7 @@ mod tests {
         let secreto = secreto_de_prueba();
         let payload = payload_de_prueba();
 
-        let token = generar_token(&payload, &secreto);
+        let token = generar_token(&payload, &secreto).expect("generar_token no debe fallar con datos validos");
         let recuperado = validar_token(&token, &secreto).expect("token valido debe decodificar");
 
         assert_eq!(recuperado, payload);
@@ -100,7 +102,7 @@ mod tests {
         let secreto = secreto_de_prueba();
         let payload = payload_de_prueba();
 
-        let token = generar_token(&payload, &secreto);
+        let token = generar_token(&payload, &secreto).expect("generar_token no debe fallar con datos validos");
         let mut bytes = token.into_bytes();
         // Flip the last base64 character to corrupt the authenticated ciphertext.
         let ultimo = bytes.len() - 1;
@@ -118,7 +120,7 @@ mod tests {
         let secreto_validador = cargar_secret("secreto-B");
         let payload = payload_de_prueba();
 
-        let token = generar_token(&payload, &secreto_generador);
+        let token = generar_token(&payload, &secreto_generador).expect("generar_token no debe fallar con datos validos");
         let resultado = validar_token(&token, &secreto_validador);
 
         assert_eq!(resultado, Err(TokenError::AutenticacionFallida));

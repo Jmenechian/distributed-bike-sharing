@@ -35,7 +35,7 @@ impl Sede {
         ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
 
-    fn generar_comprobante(sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], bici_id: String) -> BiciAlquilada {
+    fn generar_comprobante(sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], bici_id: String) -> Result<BiciAlquilada, token::TokenError> {
         let alquiler_id = Uuid::new_v4().to_string();
         let inicio_ts = timestamp_actual();
 
@@ -46,9 +46,9 @@ impl Sede {
             sede_origen_id: sede_id,
             inicio_ts,
         };
-        let token_alquiler = token::generar_token(&payload, token_secret);
+        let token_alquiler = token::generar_token(&payload, token_secret)?;
 
-        BiciAlquilada::new(bici_id, alquiler_id, cliente_id.to_string(), sede_id, inicio_ts, token_alquiler)
+        Ok(BiciAlquilada::new(bici_id, alquiler_id, cliente_id.to_string(), sede_id, inicio_ts, token_alquiler))
     }
 
     async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
@@ -95,10 +95,17 @@ impl Handler<SolicitarBici> for Sede {
                     RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento"))
                 }
                 Some((idx, bici_id)) => {
-                    let bici = Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id);
-                    println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
-                    let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
-                    RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)
+                    match Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id) {
+                        Err(_) => {
+                            println!("[sede] Envia AlquilerRechazado: error generando token");
+                            RespuestaSolicitarBici::AlquilerRechazado(String::from("Error interno al generar el token de alquiler"))
+                        }
+                        Ok(bici) => {
+                            println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
+                            let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
+                            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)
+                        }
+                    }
                 }
             }
         })
