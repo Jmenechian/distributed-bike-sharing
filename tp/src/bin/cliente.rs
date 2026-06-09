@@ -248,7 +248,7 @@ async fn main() {
 mod tests {
     use super::*;
     use matenmutex::types::Bici;
-    use matenmutex::utils::PREMONTO;
+    use matenmutex::common::PREMONTO;
 
     fn cliente_de_prueba() -> Cliente {
         Cliente::new(1, (-34.6037, -58.3816), 9999999)

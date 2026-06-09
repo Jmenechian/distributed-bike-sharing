@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::utils::{DISTANCIA_MINIMA, PREMONTO, TASA};
+use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, TASA};
 
 pub struct Sede {
     sede_id: u32,
