@@ -52,7 +52,8 @@ impl Cliente {
     }
 
     fn recargar_dinero(&mut self, monto: u32) {
-        println!("[cliente] Recarga de: {}", monto);
+        self.dinero += monto;
+        println!("[cliente] Recarga de ${}. Dinero actual: ${}", monto, self.dinero);
     }
 
     async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
