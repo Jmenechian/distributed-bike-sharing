@@ -1,7 +1,7 @@
-use crate::messages::sede_cliente::RespuestaSolicitarBici;
-use crate::types::Bici;
 use actix::Message;
 use serde::{Deserialize, Serialize};
+use crate::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+use crate::types::BiciAlquilada;
 
 #[derive(Serialize, Deserialize)]
 pub struct SolicitarBici {
@@ -10,8 +10,13 @@ pub struct SolicitarBici {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct AckComprobanteAlquiler {
+    pub alquiler_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct DevolverBici {
-    pub bici: Bici,
+    pub bici: BiciAlquilada,
     pub coords: (f64, f64),
 }
 
@@ -22,6 +27,7 @@ pub struct PreguntarBicis; // No esta en el readme
 #[derive(Serialize, Deserialize)]
 pub enum MsgClienteASede {
     SolicitarBici(SolicitarBici),
+    AckComprobanteAlquiler(AckComprobanteAlquiler),
     DevolverBici(DevolverBici),
     PreguntarBicis(PreguntarBicis),
 }
@@ -30,8 +36,12 @@ impl Message for SolicitarBici {
     type Result = RespuestaSolicitarBici;
 }
 
+impl Message for AckComprobanteAlquiler {
+    type Result = RespuestaSolicitarBici;
+}
+
 impl Message for DevolverBici {
-    type Result = Option<Bici>;
+    type Result = RespuestaDevolverBici;
 }
 
 impl Message for PreguntarBicis {
