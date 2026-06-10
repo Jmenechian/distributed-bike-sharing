@@ -12,7 +12,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
+use matenmutex::slot::Cancelar;
 use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, TASA};
+use std::io;
+use tokio::net::TcpStream;
+
+const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:6001";
 
 pub struct Sede {
     sede_id: u32,
@@ -20,6 +26,29 @@ pub struct Sede {
     slots: Vec<Addr<Slot>>,
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
+    procesador_pagos_addr: String,
+}
+
+/// Abre una conexion TCP nueva al ProcesadorPagos, envia un mensaje
+/// JSON-lines y espera la respuesta. Modelado sobre
+/// `enviar_mensaje_a_sede` de cliente.rs.
+async fn enviar_a_procesador_pagos(
+    addr: &str,
+    msg: MsgSedeAProcesadorPagos,
+) -> Result<MsgProcesadorPagosASede, io::Error> {
+    let stream = TcpStream::connect(addr).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    let payload = serde_json::to_string(&msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        + "\n";
+    writer.write_all(payload.as_bytes()).await?;
+
+    match lines.next_line().await? {
+        Some(l) => serde_json::from_str(&l).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "procesador cerro la conexion")),
+    }
 }
 
 impl Sede {
@@ -97,6 +126,7 @@ impl Handler<SolicitarBici> for Sede {
         let mut dinero = msg.dinero;
         let token_secret = self.token_secret;
         let sede_addr = ctx.address();
+        let procesador_pagos_addr = self.procesador_pagos_addr.clone();
 
         Box::pin(async move {
             match Self::reservar_bici(&slots).await {
@@ -105,16 +135,46 @@ impl Handler<SolicitarBici> for Sede {
                     RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento"))
                 }
                 Some((idx, bici_id)) => {
-                    match Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id) {
-                        Err(_) => {
-                            println!("[sede] Envia AlquilerRechazado: error generando token");
-                            RespuestaSolicitarBici::AlquilerRechazado(String::from("Error interno al generar el token de alquiler"))
+                    let payment_request_id = Uuid::new_v4().to_string();
+                    let solicitud_pre_autorizacion = MsgSedeAProcesadorPagos::PreAutorizarPago {
+                        payment_request_id: payment_request_id.clone(),
+                        cliente_id: cliente_id.to_string(),
+                        monto_seguridad: PREMONTO as f64,
+                    };
+                    println!("[sede] Envia {}", solicitud_pre_autorizacion.describir());
+                    let preautorizacion = enviar_a_procesador_pagos(&procesador_pagos_addr, solicitud_pre_autorizacion).await;
+
+                    match preautorizacion {
+                        Ok(MsgProcesadorPagosASede::PagoPreAutorizado { payment_request_id, pago_id }) => {
+                            println!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoPreAutorizado { payment_request_id: payment_request_id.clone(), pago_id: pago_id.clone() }.describir());
+                            match Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id) {
+                                Err(_) => {
+                                    println!("[sede] Envia AlquilerRechazado: error generando token");
+                                    let _ = slots[idx].send(Cancelar).await;
+                                    RespuestaSolicitarBici::AlquilerRechazado(String::from("Error interno al generar el token de alquiler"))
+                                }
+                                Ok(bici) => {
+                                    println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
+                                    let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
+                                    dinero -= PREMONTO;
+                                    RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
+                                }
+                            }
                         }
-                        Ok(bici) => {
-                            println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
-                            let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
-                            dinero -= PREMONTO;
-                            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
+                        Ok(MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo }) => {
+                            println!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo: motivo.clone() }.describir());
+                            let _ = slots[idx].send(Cancelar).await;
+                            RespuestaSolicitarBici::AlquilerRechazado(format!("El procesador de pagos rechazo la pre-autorizacion: {}", motivo))
+                        }
+                        Ok(_) => {
+                            println!("[sede] Respuesta inesperada del procesador de pagos");
+                            let _ = slots[idx].send(Cancelar).await;
+                            RespuestaSolicitarBici::AlquilerRechazado(String::from("Respuesta inesperada del procesador de pagos"))
+                        }
+                        Err(e) => {
+                            println!("[sede] Error comunicandose con el procesador de pagos: {}", e);
+                            let _ = slots[idx].send(Cancelar).await;
+                            RespuestaSolicitarBici::AlquilerRechazado(String::from("No se pudo procesar el pago de pre-autorizacion"))
                         }
                     }
                 }
@@ -242,6 +302,59 @@ mod tests {
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
+        sede_con_estados_y_procesador(estados, PROCESADOR_PAGOS_ADDR_DEFAULT.to_string())
+    }
+
+    /// Levanta un ProcesadorPagos de prueba que responde siempre
+    /// `PagoPreAutorizado` (o `PagoRechazado` si `rechazar` es true) a
+    /// cualquier `PreAutorizarPago` recibido. Devuelve la direccion en la
+    /// que escucha.
+    async fn stub_procesador_pagos(rechazar: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let (reader, mut writer) = socket.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let resp = match serde_json::from_str::<MsgSedeAProcesadorPagos>(line.trim()) {
+                            Ok(MsgSedeAProcesadorPagos::PreAutorizarPago { payment_request_id, .. }) => {
+                                if rechazar {
+                                    MsgProcesadorPagosASede::PagoRechazado {
+                                        payment_request_id,
+                                        motivo: "rechazo simulado en test".to_string(),
+                                    }
+                                } else {
+                                    MsgProcesadorPagosASede::PagoPreAutorizado {
+                                        payment_request_id,
+                                        pago_id: "pago-test".to_string(),
+                                    }
+                                }
+                            }
+                            _ => MsgProcesadorPagosASede::PagoRechazado {
+                                payment_request_id: String::new(),
+                                motivo: "mensaje no soportado por el stub".to_string(),
+                            },
+                        };
+                        let payload = serde_json::to_string(&resp).unwrap() + "\n";
+                        if writer.write_all(payload.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
+
+    fn sede_con_estados_y_procesador(estados: Vec<EstadoSlot>, procesador_pagos_addr: String) -> Addr<Sede> {
         let slots = crear_slots_con_estados(estados);
         Sede {
             sede_id: 1,
@@ -249,13 +362,15 @@ mod tests {
             slots,
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
+            procesador_pagos_addr,
         }
         .start()
     }
 
     #[actix_rt::test]
     async fn solicitar_bici_con_slot_disponible_confirma_con_bici_id_real() {
-        let sede = sede_con_estados(vec![
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let sede = sede_con_estados_y_procesador(vec![
             EstadoSlot::Reservado {
                 bici_id: "1-1".to_string(),
             },
@@ -263,7 +378,7 @@ mod tests {
             EstadoSlot::Disponible {
                 bici_id: "1-3".to_string(),
             },
-        ]);
+        ], procesador_addr);
 
         let respuesta = sede
             .send(SolicitarBici {
@@ -330,9 +445,10 @@ mod tests {
 
     #[actix_rt::test]
     async fn solicitar_bici_concurrente_sobre_un_unico_slot_disponible_solo_uno_gana() {
-        let sede = sede_con_estados(vec![EstadoSlot::Disponible {
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let sede = sede_con_estados_y_procesador(vec![EstadoSlot::Disponible {
             bici_id: "1-1".to_string(),
-        }]);
+        }], procesador_addr);
 
         let sede_a = sede.clone();
         let sede_b = sede.clone();
@@ -442,8 +558,79 @@ mod tests {
             }
         }
     }
-    
-    
+
+    #[actix_rt::test]
+    async fn solicitar_bici_con_preautorizacion_aceptada_emite_comprobante() {
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let sede = sede_con_estados_y_procesador(
+            vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }],
+            procesador_addr,
+        );
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 1,
+                coords: (-34.6037, -58.3816),
+                dinero: 999999,
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, _) => {
+                assert_eq!(bici.bici_id(), "1-1");
+            }
+            other => panic!("se esperaba ComprobanteAlquilerEmitido, se obtuvo {:?}", other),
+        }
+    }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_con_preautorizacion_rechazada_cancela_la_reserva() {
+        let procesador_addr = stub_procesador_pagos(true).await;
+        let sede = sede_con_estados_y_procesador(
+            vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }],
+            procesador_addr,
+        );
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 1,
+                coords: (-34.6037, -58.3816),
+                dinero: 999999,
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::AlquilerRechazado(_) => {}
+            other => panic!("se esperaba AlquilerRechazado, se obtuvo {:?}", other),
+        }
+
+        // El slot debe haber vuelto a Disponible (no quedo Reservado), por
+        // lo que una nueva reserva sobre el mismo slot debe ser posible.
+        let resultado = sede.send(ConsultarEstadoSlot { idx: 0 }).await.unwrap();
+        assert_eq!(resultado, ResultadoReserva::Reservada("1-1".to_string()));
+    }
+}
+
+#[cfg(test)]
+struct ConsultarEstadoSlot {
+    idx: usize,
+}
+
+#[cfg(test)]
+impl actix::Message for ConsultarEstadoSlot {
+    type Result = ResultadoReserva;
+}
+
+#[cfg(test)]
+impl Handler<ConsultarEstadoSlot> for Sede {
+    type Result = ResponseFuture<ResultadoReserva>;
+
+    fn handle(&mut self, msg: ConsultarEstadoSlot, _ctx: &mut Context<Self>) -> Self::Result {
+        let slot = self.slots[msg.idx].clone();
+        Box::pin(async move { slot.send(Reservar).await.unwrap_or(ResultadoReserva::Rechazada) })
+    }
 }
 
 
@@ -489,12 +676,16 @@ async fn main() {
     let num_slots = 20;
     let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
 
+    let procesador_pagos_addr = env::var("PROCESADOR_PAGOS_ADDR")
+        .unwrap_or_else(|_| PROCESADOR_PAGOS_ADDR_DEFAULT.to_string());
+
     let sede = Sede {
         sede_id: sede_id,
         coords: (-34.6037, -58.3816),
         slots: slots,
         token_secret,
         pending_reservas: std::collections::HashMap::new(),
+        procesador_pagos_addr,
     }
     .start();
 
