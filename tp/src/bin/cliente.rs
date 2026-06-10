@@ -52,7 +52,8 @@ impl Cliente {
     }
 
     fn recargar_dinero(&mut self, monto: u32) {
-        println!("[cliente] Recarga de: {}", monto);
+        self.dinero += monto;
+        println!("[cliente] Recarga de ${}. Dinero actual: ${}", monto, self.dinero);
     }
 
     async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
@@ -247,7 +248,7 @@ async fn main() {
 mod tests {
     use super::*;
     use matenmutex::types::Bici;
-    use matenmutex::utils::PREMONTO;
+    use matenmutex::common::PREMONTO;
 
     fn cliente_de_prueba() -> Cliente {
         Cliente::new(1, (-34.6037, -58.3816), 9999999)

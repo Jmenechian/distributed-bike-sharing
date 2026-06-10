@@ -17,8 +17,8 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::messages::sedes::{Heartbeat, MsgSedeASede, SedeInfo, crear_info_dummy, ActualizarDisponibilidad, GetInfo, GetSedesConocidas};
-use matenmutex::utils::{DISTANCIA_MINIMA, PREMONTO, PUERTO_BASE, TASA};
+use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, PUERTO_BASE, TASA};
+use matenmutex::messages::sedes::{ActualizarDisponibilidad, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
 
 pub struct Sede {
     sede_id: u32,
@@ -130,7 +130,8 @@ impl Handler<SolicitarBici> for Sede {
         }
 
         if !self.cliente_tiene_dinero_solicitar(msg.dinero) {
-            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe tener minimo x guita")) });
+            let msg = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${})", PREMONTO);
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from(msg)) });
         }
 
         let slots = self.slots.clone();
@@ -297,6 +298,7 @@ mod tests {
     use super::*;
     use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+    use matenmutex::messages::sedes::crear_info_dummy;
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
