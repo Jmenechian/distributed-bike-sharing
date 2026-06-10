@@ -47,9 +47,15 @@ pub fn crear_info_dummy() -> SedeInfo {
     }
 }
 
-pub struct ActualizarDisponibilidad;
+pub struct ActualizarDisponibilidadSolicitar;
 
-impl Message for ActualizarDisponibilidad {
+impl Message for ActualizarDisponibilidadSolicitar {
+    type Result = ();
+}
+
+pub struct ActualizarDisponibilidadDevolver;
+
+impl Message for ActualizarDisponibilidadDevolver {
     type Result = ();
 }
 
