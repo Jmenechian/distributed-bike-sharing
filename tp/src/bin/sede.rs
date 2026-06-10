@@ -99,6 +99,16 @@ impl Sede {
         bici_ganadora
     }
 
+    fn generar_msg_de_cobro(monto: u32, alquiler_id: String, cliente_id: String) -> MsgSedeAProcesadorPagos {
+        let payment_request_id = Uuid::new_v4().to_string();
+        let cobro = MsgSedeAProcesadorPagos::CobrarPago {
+            payment_request_id,
+            alquiler_id,
+            cliente_id,
+            monto_final: monto as f64,
+        };
+        cobro
+    }
 }
 
 impl Actor for Sede {
@@ -112,12 +122,15 @@ impl Handler<SolicitarBici> for Sede {
         println!("Hola Bici");
 
         if !self.cliente_en_rango(msg.coords) {
-            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede")) });
+            let motivo = String::from("Para poder tomar la bici debe estar mas cerca de la sede");
+            println!("[sede] Envia AlquilerRechazado: {}", motivo);
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(motivo) });
         }
 
         if !self.cliente_tiene_dinero_solicitar(msg.dinero) {
-            let msg = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${})", PREMONTO);
-            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from(msg)) });
+            let motivo = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${})", PREMONTO);
+            println!("[sede] Envia AlquilerRechazado: {}", motivo);
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(motivo) });
         }
 
         let slots = self.slots.clone();
@@ -227,21 +240,50 @@ impl Handler<DevolverBici> for Sede {
         println!("Chau Bici");
 
         if !self.cliente_en_rango(msg.coords) {
-            return Box::pin(async move {
-                RespuestaDevolverBici::DevolucionRechazada(String::from("Para poder devolver la bici debe estar mas cerca de la sede"))
-            });
+            let motivo = String::from("Para poder devolver la bici debe estar mas cerca de la sede");
+            println!("[sede] Envia DevolucionRechazada: {}", motivo);
+            return Box::pin(async move { RespuestaDevolverBici::DevolucionRechazada(motivo) });
         }
 
         let dinero = msg.dinero;
         let monto = match preparar_monto(msg.dinero, msg.bici.inicio_ts()) {
             Ok(costo) => costo,
-            Err(respuesta) => return Box::pin(async move { respuesta }),
+            Err(respuesta) => {
+                if let RespuestaDevolverBici::DevolucionRechazada(ref motivo) = respuesta {
+                    println!("[sede] Envia DevolucionRechazada: {}", motivo);
+                }
+                return Box::pin(async move { respuesta });
+            }
         };
 
         let slots = self.slots.clone();
         let bici_id = msg.bici.bici_id().to_string();
+        let procesador_pagos_addr = self.procesador_pagos_addr.clone();
+        let alquiler_id = msg.bici.alquiler_id().to_string();
+        let cliente_id = msg.bici.cliente_id().to_string();
 
         Box::pin(async move {
+            let cobro = Self::generar_msg_de_cobro(monto, alquiler_id, cliente_id);
+            println!("[sede] Envia {}", cobro.describir());
+
+            match enviar_a_procesador_pagos(&procesador_pagos_addr, cobro).await {
+                Ok(MsgProcesadorPagosASede::PagoAceptado { payment_request_id, pago_id }) => {
+                    println!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoAceptado { payment_request_id, pago_id }.describir());
+                }
+                Ok(MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo }) => {
+                    println!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo: motivo.clone() }.describir());
+                    return RespuestaDevolverBici::DevolucionRechazada(format!("El procesador de pagos rechazo el cobro: {}", motivo));
+                }
+                Ok(otra) => {
+                    println!("[sede] Recibe {}", otra.describir());
+                    return RespuestaDevolverBici::DevolucionRechazada(String::from("Respuesta inesperada del procesador de pagos"));
+                }
+                Err(e) => {
+                    println!("[sede] Error comunicandose con el procesador de pagos: {}", e);
+                    return RespuestaDevolverBici::DevolucionRechazada(String::from("No se pudo procesar el cobro de la devolucion"));
+                }
+            }
+
             for slot in slots.iter() {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
                     Ok(true) => {
@@ -334,6 +376,19 @@ mod tests {
                                     MsgProcesadorPagosASede::PagoPreAutorizado {
                                         payment_request_id,
                                         pago_id: "pago-test".to_string(),
+                                    }
+                                }
+                            }
+                            Ok(MsgSedeAProcesadorPagos::CobrarPago { payment_request_id, .. }) => {
+                                if rechazar {
+                                    MsgProcesadorPagosASede::PagoRechazado {
+                                        payment_request_id,
+                                        motivo: "rechazo simulado en test".to_string(),
+                                    }
+                                } else {
+                                    MsgProcesadorPagosASede::PagoAceptado {
+                                        payment_request_id,
+                                        pago_id: "cobro-test".to_string(),
                                     }
                                 }
                             }
@@ -479,7 +534,8 @@ mod tests {
 
     #[actix_rt::test]
     async fn devolver_bici_con_slot_vacio_asegura_la_bici_y_responde_ok() {
-        let sede = sede_con_estados(vec![
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let sede = sede_con_estados_y_procesador(vec![
             EstadoSlot::Disponible {
                 bici_id: "1-1".to_string(),
             },
@@ -487,7 +543,7 @@ mod tests {
             EstadoSlot::Reservado {
                 bici_id: "1-3".to_string(),
             },
-        ]);
+        ], procesador_addr);
 
         let respuesta = sede
             .send(DevolverBici {
@@ -509,15 +565,52 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn devolver_bici_con_cobro_rechazado_no_asegura() {
+        let procesador_addr = stub_procesador_pagos(true).await;
+        let sede = sede_con_estados_y_procesador(vec![
+            EstadoSlot::Disponible {
+                bici_id: "1-1".to_string(),
+            },
+            EstadoSlot::Vacio,
+            EstadoSlot::Reservado {
+                bici_id: "1-3".to_string(),
+            },
+        ], procesador_addr);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
+                coords: (-34.6037, -58.3816),
+                dinero: 999999,
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionRechazada(_) => {}
+            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+                panic!("se esperaba DevolucionRechazada, se obtuvo DevolucionOk");
+            }
+        }
+
+        // El slot vacio (idx 1) debe seguir vacio: AsegurarBici no debe
+        // haberse ejecutado, por lo que Reservar (que solo aplica a slots
+        // Disponible) sigue siendo Rechazada sobre el slot Vacio.
+        let resultado = sede.send(ConsultarEstadoSlot { idx: 1 }).await.unwrap();
+        assert_eq!(resultado, ResultadoReserva::Rechazada);
+    }
+
+    #[actix_rt::test]
     async fn devolver_bici_sin_slots_vacios_rechaza() {
-        let sede = sede_con_estados(vec![
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let sede = sede_con_estados_y_procesador(vec![
             EstadoSlot::Disponible {
                 bici_id: "1-1".to_string(),
             },
             EstadoSlot::Reservado {
                 bici_id: "1-2".to_string(),
             },
-        ]);
+        ], procesador_addr);
 
         let respuesta = sede
             .send(DevolverBici {

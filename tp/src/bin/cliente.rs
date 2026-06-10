@@ -107,7 +107,7 @@ impl Cliente {
                     self.bici_activa = Some(bici_confirmada);
                 }
                 Ok(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
-                    println!("Alquiler rechazado en confirmacion: {motivo}");
+                    println!("[cliente] Recibe AlquilerRechazado (motivo {})", motivo);
                 }
                 _ => println!("Sede: {}", respuesta),
             }
@@ -120,7 +120,10 @@ impl Cliente {
                 println!("[cliente] Recibe ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                 Ok((bici,dinero))
             }
-            Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => { Err(io::Error::new(io::ErrorKind::Other, format!("Alquiler rechazado: {motivo}"))) }
+            Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
+                println!("[cliente] Recibe AlquilerRechazado (motivo {})", motivo);
+                Err(io::Error::new(io::ErrorKind::Other, format!("Alquiler rechazado: {motivo}")))
+            }
             _ => { Err(io::Error::new(io::ErrorKind::Other, "Respuesta inesperada de la sede")) }
         }
     }
@@ -167,7 +170,7 @@ impl Cliente {
                 self.bici_activa = None;
             }
             RespuestaDevolverBici::DevolucionRechazada(motivo) => {
-                println!("Devolucion rechazada: {motivo}");
+                println!("[cliente] Recibe DevolucionRechazada (motivo {})", motivo);
             }
         }
     }
@@ -203,7 +206,7 @@ async fn enviar_mensaje_a_sede(
 
 #[actix_rt::main]
 async fn main() {
-    let mut cliente = Cliente::new(42, (-34.6037, -58.3816), 10000);
+    let mut cliente = Cliente::new(42, (-34.6037, -58.3816), 0);
 
     println!(
         "\n{BOLD_CYAN}=== Mate&Mutex CLI ==={RESET}\n\
