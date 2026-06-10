@@ -1,24 +1,20 @@
 use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
-use matenmutex::messages::cliente_sede::{
-    AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
-};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::slot;
-use matenmutex::slot::{AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, Slot};
+use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
 use serde::Serialize;
 use std::env;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::RwLock;
 use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sedes::{ActualizarDisponibilidad, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
+use matenmutex::messages::sedes::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
 
 pub struct Sede {
     sede_id: u32,
@@ -27,32 +23,16 @@ pub struct Sede {
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
     sedes_conocidas: Vec<SedeInfo>,
-    mi_info: SedeInfo,
-}
-
-
-
-fn id_de_addr(addr: &SocketAddr) -> u32 {
-    (addr.port() - PUERTO_BASE) as u32
-}
-
-fn addr_de_id(id: u32, ip: IpAddr) -> SocketAddr {
-    SocketAddr::new(ip, PUERTO_BASE + id as u16)
+    sede_info: SedeInfo,
 }
 
 impl Sede {
     fn cliente_en_rango(&self, coords: (f64, f64)) -> bool {
-        self.calcular_distancia(coords) <= DISTANCIA_MINIMA
+        calcular_distancia(self.coords, coords) <= DISTANCIA_MINIMA
     }
 
     fn cliente_tiene_dinero_solicitar(&self, dinero: u32) -> bool {
         dinero > PREMONTO
-    }
-    fn calcular_distancia(&self, coords: (f64, f64)) -> f64 {
-        let (coords_sede_x, coords_sede_y) = self.coords;
-        let (coords_cliente_x, coords_cliente_y) = coords;
-
-        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
 
     fn generar_comprobante(sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], bici_id: String) -> Result<BiciAlquilada, token::TokenError> {
@@ -94,20 +74,30 @@ impl Actor for Sede {
     type Context = Context<Self>;
 }
 
-impl Handler<ActualizarDisponibilidad> for Sede {
+impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
     type Result = ();
 
-    fn handle(&mut self, _msg: ActualizarDisponibilidad, _ctx: &mut Self::Context) -> Self::Result {
-        self.mi_info.slots_disponibles -= 1;
-        self.mi_info.ultimo_update_ts = timestamp_actual();
+    fn handle(&mut self, _msg: ActualizarDisponibilidadSolicitar, _ctx: &mut Self::Context) -> Self::Result {
+        self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_sub(1);
+        self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_add(1);
+        self.sede_info.ultimo_update_ts = timestamp_actual();
     }
 }
 
+impl Handler<ActualizarDisponibilidadDevolver> for Sede { //maybe algo que revise los slots? por ahora bien basicon
+    type Result = ();
+
+    fn handle(&mut self, msg: ActualizarDisponibilidadDevolver, ctx: &mut Self::Context) -> Self::Result {
+        self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_add(1);
+        self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_sub(1);
+        self.sede_info.ultimo_update_ts = timestamp_actual();
+    }
+}
 impl Handler<GetInfo> for Sede {
     type Result = MessageResult<GetInfo>;
 
     fn handle(&mut self, _msg: GetInfo, _ctx: &mut Self::Context) -> Self::Result {
-        MessageResult(self.mi_info.clone())
+        MessageResult(self.sede_info.clone())
     }
 }
 
@@ -119,12 +109,19 @@ impl Handler<GetSedesConocidas> for Sede {
     }
 }
 
+impl Handler<PedirSedes> for Sede {
+    type Result = MessageResult<PedirSedes>;
+
+    fn handle(&mut self, _msg: PedirSedes, _ctx: &mut Self::Context) -> Self::Result {
+        let mut sedes_conocidas = self.sedes_conocidas.clone();
+        sedes_conocidas.push(self.sede_info.clone());
+         MessageResult(sedes_conocidas.clone())
+    }
+}
 impl Handler<SolicitarBici> for Sede {
     type Result = ResponseFuture<RespuestaSolicitarBici>;
 
     fn handle(&mut self, msg: SolicitarBici, ctx: &mut Context<Self>) -> Self::Result {
-        println!("Hola Bici");
-
         if !self.cliente_en_rango(msg.coords) {
             return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede")) });
         }
@@ -156,7 +153,7 @@ impl Handler<SolicitarBici> for Sede {
                         Ok(bici) => {
                             println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                             let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
-                            let _ = sede_addr.send(ActualizarDisponibilidad).await;
+                            let _ = sede_addr.send(ActualizarDisponibilidadSolicitar).await;
                             dinero -= PREMONTO;
                             RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                         }
@@ -164,6 +161,39 @@ impl Handler<SolicitarBici> for Sede {
                 }
             }
         })
+    }
+}
+
+impl Handler<ActualizarSlots> for Sede {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, _msg: ActualizarSlots, ctx: &mut Context<Self>) -> Self::Result {
+        let requests: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.send(ConsultarBici))
+            .collect();
+
+        let addr = ctx.address(); // clonable, se puede mover al async block
+
+        Box::pin(async move {
+            let resultados = futures::future::join_all(requests).await;
+            let lineas: Vec<String> = resultados.into_iter().filter_map(|r| r.ok()).collect();
+            let total = lineas.len();
+            let ocupados = lineas.iter().filter(|l| !l.contains("sin bici")).count();
+            let vacios = total - ocupados;
+
+            addr.do_send(SetSlotCounts { ocupados: ocupados as u8, vacios: vacios as u8 });
+        })
+    }
+}
+
+impl Handler<SetSlotCounts> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: SetSlotCounts, _ctx: &mut Context<Self>) {
+        self.sede_info.slots_disponibles = msg.ocupados;
+        self.sede_info.slots_vacios = msg.vacios;
     }
 }
 
@@ -207,9 +237,7 @@ impl Handler<AckComprobanteAlquiler> for Sede {
 impl Handler<DevolverBici> for Sede {
     type Result = ResponseFuture<RespuestaDevolverBici>;
 
-    fn handle(&mut self, msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
-        println!("Chau Bici");
-
+    fn handle(&mut self, msg: DevolverBici, ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
             return Box::pin(async move {
                 RespuestaDevolverBici::DevolucionRechazada(String::from("Para poder devolver la bici debe estar mas cerca de la sede"))
@@ -224,12 +252,13 @@ impl Handler<DevolverBici> for Sede {
 
         let slots = self.slots.clone();
         let bici_id = msg.bici.bici_id().to_string();
+        let sede_addr = ctx.address();
 
         Box::pin(async move {
             for slot in slots.iter() {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
                     Ok(true) => {
-
+                        let _ = sede_addr.send(ActualizarDisponibilidadDevolver).await;
                         return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto);
                     }
                     _ => continue,
@@ -284,10 +313,10 @@ impl Handler<Heartbeat> for Sede {
 
     fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
         println!("[sede] Recibe Heartbeat de {}", msg.sede_id);
-        println!("[sede] info: {:?}", msg.info);
+        println!("[sede] info: {:?}", msg.info); //para debug
 
         match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == msg.info.sede_id) {
-            Some(known) => *known = msg.info,
+            Some(sedes) => *sedes = msg.info,
             None => self.sedes_conocidas.push(msg.info),
         }
     }
@@ -295,6 +324,7 @@ impl Handler<Heartbeat> for Sede {
 
 #[cfg(test)]
 mod tests {
+    use matenmutex::common::MAX_VALUE;
     use super::*;
     use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
@@ -302,7 +332,7 @@ mod tests {
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
-        let dummy_info = crear_info_dummy();
+        let dummy_info = rellenar_ocupados_vacios_testing(&estados);
         let slots = crear_slots_con_estados(estados);
         Sede {
             sede_id: 1,
@@ -311,9 +341,23 @@ mod tests {
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
             sedes_conocidas: vec![],
-            mi_info: dummy_info,
+            sede_info: dummy_info,
         }
         .start()
+    }
+
+    fn rellenar_ocupados_vacios_testing(estados: &Vec<EstadoSlot>) -> SedeInfo {
+        let ocupados = estados.iter()
+            .filter(|e| matches!(e, EstadoSlot::Disponible { .. }))
+            .count() as u8;
+        let vacios = estados.iter()
+            .filter(|e| matches!(e, EstadoSlot::Vacio))
+            .count() as u8;
+
+        let mut dummy_info = crear_info_dummy();
+        dummy_info.slots_disponibles = ocupados;
+        dummy_info.slots_vacios = vacios;
+        dummy_info
     }
 
     #[actix_rt::test]
@@ -332,7 +376,7 @@ mod tests {
             .send(SolicitarBici {
                 cliente_id: 42,
                 coords: (-34.6037, -58.3816),
-                dinero: 999999,
+                dinero: MAX_VALUE,
             })
             .await
             .unwrap();
@@ -440,7 +484,7 @@ mod tests {
             .send(DevolverBici {
                 bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (-34.6037, -58.3816),
-                dinero: 999999,
+                dinero: MAX_VALUE,
             })
             .await
             .unwrap();
@@ -544,11 +588,12 @@ async fn main() {
     let sede_id = n as u32;
     let num_slots = 20;
     let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
-    let coords = (-34.6037, -58.3816); //ver dps cambiar coords json?
+    let coords = (-34.6037, -58.3816); //ver dps cambiar coords
 
-    let mi_info = crear_sede_info(n, sede_id, coords);
+    let sede_info = crear_sede_info(n, sede_id, coords);
 
-    let sede = crear_sede(token_secret, sede_id, slots, coords, mi_info.clone());
+    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info);
+    sede.do_send(ActualizarSlots);
 
     let public_addr = format!("127.0.0.1:808{}", n);
     let private_addr = format!("127.0.0.1:700{}", n);
@@ -580,19 +625,19 @@ async fn main() {
     // sender
     let udp_tx = udp.clone();
     let sede_tx = sede.clone();
-    let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect();
+    let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
     tokio::spawn(async move {
-        let mut bootstrapped = false;
+        let mut bootstrapped = false; //para no pegarle a todos lados
 
         loop {
             let info = sede_tx.send(GetInfo).await.unwrap();
-            let known = sede_tx.send(GetSedesConocidas).await.unwrap(); // new message
+            let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
 
             let targets: Vec<String> = if !bootstrapped {
                 bootstrapped = true;
                 other_sedes.iter().map(|s| format!("127.0.0.1:700{}", s)).collect()
             } else {
-                known.iter().map(|s| s.private_addr.clone()).collect()
+                sedes_conocidas.iter().map(|s| s.private_addr.clone()).collect()
             };
 
             let heartbeat = serde_json::to_vec(
@@ -603,7 +648,7 @@ async fn main() {
                 udp_tx.send_to(&heartbeat, addr.as_str()).await.ok();
             }
 
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
         }
     });
 
@@ -611,7 +656,7 @@ async fn main() {
 }
 
 fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
-    let mi_info = SedeInfo {
+    SedeInfo {
         sede_id,
         coords,
         public_addr: format!("127.0.0.1:808{}", n),
@@ -620,19 +665,18 @@ fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
         slots_disponibles: 99,
         conectada: true,
         ultimo_update_ts: timestamp_actual(),
-    };
-    mi_info
+    }
 }
 
-fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), mi_info: SedeInfo) -> Addr<Sede> {
+fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), sede_info: SedeInfo) -> Addr<Sede> {
     let sede = Sede {
-        sede_id: sede_id,
-        coords: coords,
-        slots: slots,
+        sede_id,
+        coords,
+        slots,
         token_secret,
         pending_reservas: std::collections::HashMap::new(),
         sedes_conocidas: vec![],
-        mi_info,
+        sede_info,
     }
         .start();
     sede
@@ -691,6 +735,9 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
                     Ok(MsgClienteASede::PreguntarBicis(msg)) => {
                         formatear_respuesta(sede.send(msg).await).await
                     }
+                    Ok(MsgClienteASede::PedirSedes(msg)) => {
+                        formatear_respuesta(sede.send(msg).await).await
+                    }
                     Err(_) => format!("UNKNOWN:{}\n", line.trim()),
                 };
 
@@ -703,5 +750,4 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
         });
     }
 }
-
 
