@@ -1,21 +1,23 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+
+
 pub fn timestamp_actual() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_secs()
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Bici {
     pub bici_id: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BiciAlquilada {
-    bici_id: String,
+    pub bici_id: String,
     alquiler_id: String,
     cliente_id: String,
     sede_origen_id: u32,

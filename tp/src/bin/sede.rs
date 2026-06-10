@@ -12,8 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-
-const DISTANCIA_MINIMA: f64 = 2.0;
+use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, TASA};
 
 pub struct Sede {
     sede_id: u32,
@@ -28,6 +27,9 @@ impl Sede {
         self.calcular_distancia(coords) <= DISTANCIA_MINIMA
     }
 
+    fn cliente_tiene_dinero_solicitar(&self, dinero: u32) -> bool {
+        dinero > PREMONTO
+    }
     fn calcular_distancia(&self, coords: (f64, f64)) -> f64 {
         let (coords_sede_x, coords_sede_y) = self.coords;
         let (coords_cliente_x, coords_cliente_y) = coords;
@@ -52,6 +54,7 @@ impl Sede {
     }
 
     async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
+
         let mut bici_ganadora: Option<(usize, String)> = None;
         for (idx, slot) in slots.iter().enumerate() {
             match slot.send(Reservar).await {
@@ -66,6 +69,7 @@ impl Sede {
 
         bici_ganadora
     }
+
 }
 
 impl Actor for Sede {
@@ -82,9 +86,15 @@ impl Handler<SolicitarBici> for Sede {
             return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("Para poder tomar la bici debe estar mas cerca de la sede")) });
         }
 
+        if !self.cliente_tiene_dinero_solicitar(msg.dinero) {
+            let msg = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${})", PREMONTO);
+            return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from(msg)) });
+        }
+
         let slots = self.slots.clone();
         let sede_id = self.sede_id;
         let cliente_id = msg.cliente_id;
+        let mut dinero = msg.dinero;
         let token_secret = self.token_secret;
         let sede_addr = ctx.address();
 
@@ -103,7 +113,8 @@ impl Handler<SolicitarBici> for Sede {
                         Ok(bici) => {
                             println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                             let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
-                            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici)
+                            dinero -= PREMONTO;
+                            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                         }
                     }
                 }
@@ -161,19 +172,41 @@ impl Handler<DevolverBici> for Sede {
             });
         }
 
+        let dinero = msg.dinero;
+        let monto = match preparar_monto(msg.dinero, msg.bici.inicio_ts()) {
+            Ok(costo) => costo,
+            Err(respuesta) => return Box::pin(async move { respuesta }),
+        };
+
         let slots = self.slots.clone();
         let bici_id = msg.bici.bici_id().to_string();
 
         Box::pin(async move {
             for slot in slots.iter() {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
-                    Ok(true) => { return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }); }
+                    Ok(true) => {
+
+                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto);
+                    }
                     _ => continue,
                 }
             }
 
             RespuestaDevolverBici::DevolucionRechazada(String::from("No hay lugar disponible para devolver la bici en este momento"))
         })
+    }
+}
+
+fn preparar_monto(dinero: u32, tiempo_inicio: u64) -> Result<u32, RespuestaDevolverBici> {
+    let fin = timestamp_actual();
+    let duracion = fin - tiempo_inicio;
+    println!("Duracion del alquiler: {}", duracion);
+    let costo = (duracion * TASA as u64) as u32;
+
+    if costo > dinero {
+        Err(RespuestaDevolverBici::DevolucionRechazada(String::from("Para poder devolver la bici recarga")))
+    } else {
+        Ok(costo)
     }
 }
 
@@ -236,12 +269,13 @@ mod tests {
             .send(SolicitarBici {
                 cliente_id: 42,
                 coords: (-34.6037, -58.3816),
+                dinero: 999999,
             })
             .await
             .unwrap();
 
         let bici_alquilada = match respuesta {
-            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici) => bici,
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, _) => bici,
             RespuestaSolicitarBici::AlquilerRechazado(motivo) => {
                 panic!("se esperaba ComprobanteAlquilerEmitido, se obtuvo AlquilerRechazado({motivo})");
             }
@@ -281,13 +315,14 @@ mod tests {
             .send(SolicitarBici {
                 cliente_id: 42,
                 coords: (-34.6037, -58.3816),
+                dinero: 9999999,
             })
             .await
             .unwrap();
 
         match respuesta {
             RespuestaSolicitarBici::AlquilerRechazado(_) => {}
-            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_) => {
+            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_,_) => {
                 panic!("se esperaba AlquilerRechazado");
             }
         }
@@ -306,16 +341,19 @@ mod tests {
             sede_a.send(SolicitarBici {
                 cliente_id: 1,
                 coords: (-34.6037, -58.3816),
+                dinero: 9999999,
             }),
             sede_b.send(SolicitarBici {
                 cliente_id: 2,
                 coords: (-34.6037, -58.3816),
+                dinero: 9999999,
+
             })
         );
 
         let ganadores = [resp_a.unwrap(), resp_b.unwrap()]
             .into_iter()
-            .filter(|r| matches!(r, RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_)))
+            .filter(|r| matches!(r, RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_,_)))
             .count();
         let rechazados = 2 - ganadores;
 
@@ -339,12 +377,13 @@ mod tests {
             .send(DevolverBici {
                 bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (-34.6037, -58.3816),
+                dinero: 999999,
             })
             .await
             .unwrap();
 
         match respuesta {
-            RespuestaDevolverBici::DevolucionOk(bici) => {
+            RespuestaDevolverBici::DevolucionOk(bici, ..) => {
                 assert_eq!(bici.bici_id, "9-9");
             }
             RespuestaDevolverBici::DevolucionRechazada(motivo) => {
@@ -368,13 +407,15 @@ mod tests {
             .send(DevolverBici {
                 bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (-34.6037, -58.3816),
+                dinero: 999999,
+
             })
             .await
             .unwrap();
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_) => {
+            RespuestaDevolverBici::DevolucionOk(_, ..) => {
                 panic!("se esperaba DevolucionRechazada, se obtuvo DevolucionOk");
             }
         }
@@ -388,17 +429,21 @@ mod tests {
             .send(DevolverBici {
                 bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
                 coords: (0.0, 0.0),
+                dinero: 999999,
+
             })
             .await
             .unwrap();
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_) => {
+            RespuestaDevolverBici::DevolucionOk(_, ..) => {
                 panic!("se esperaba DevolucionRechazada por estar fuera de rango, se obtuvo DevolucionOk");
             }
         }
     }
+    
+    
 }
 
 
