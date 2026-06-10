@@ -1,4 +1,4 @@
-use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, ResponseFuture};
+use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
 use matenmutex::messages::cliente_sede::{
     AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
 };
@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::messages::sedes::{Heartbeat, MsgSedeASede, SedeInfo, crear_info_dummy};
+use matenmutex::messages::sedes::{Heartbeat, MsgSedeASede, SedeInfo, crear_info_dummy, ActualizarDisponibilidad, GetInfo, GetSedesConocidas};
 use matenmutex::utils::{DISTANCIA_MINIMA, PREMONTO, PUERTO_BASE, TASA};
 
 pub struct Sede {
@@ -27,7 +27,7 @@ pub struct Sede {
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
     sedes_conocidas: Vec<SedeInfo>,
-    mi_info: Arc<RwLock<SedeInfo>>,
+    mi_info: SedeInfo,
 }
 
 
@@ -94,6 +94,31 @@ impl Actor for Sede {
     type Context = Context<Self>;
 }
 
+impl Handler<ActualizarDisponibilidad> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ActualizarDisponibilidad, _ctx: &mut Self::Context) -> Self::Result {
+        self.mi_info.slots_disponibles -= 1;
+        self.mi_info.ultimo_update_ts = timestamp_actual();
+    }
+}
+
+impl Handler<GetInfo> for Sede {
+    type Result = MessageResult<GetInfo>;
+
+    fn handle(&mut self, _msg: GetInfo, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.mi_info.clone())
+    }
+}
+
+impl Handler<GetSedesConocidas> for Sede {
+    type Result = MessageResult<GetSedesConocidas>;
+
+    fn handle(&mut self, _msg: GetSedesConocidas, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.sedes_conocidas.clone())
+    }
+}
+
 impl Handler<SolicitarBici> for Sede {
     type Result = ResponseFuture<RespuestaSolicitarBici>;
 
@@ -115,7 +140,6 @@ impl Handler<SolicitarBici> for Sede {
         let token_secret = self.token_secret;
         let sede_addr = ctx.address();
 
-        let mi_info = self.mi_info.clone();
         Box::pin(async move {
             match Self::reservar_bici(&slots).await {
                 None => {
@@ -131,8 +155,7 @@ impl Handler<SolicitarBici> for Sede {
                         Ok(bici) => {
                             println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                             let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
-                            mi_info.write().await.slots_disponibles -= 1;
-                            mi_info.write().await.ultimo_update_ts = timestamp_actual();
+                            let _ = sede_addr.send(ActualizarDisponibilidad).await;
                             dinero -= PREMONTO;
                             RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                         }
@@ -259,11 +282,16 @@ impl Handler<Heartbeat> for Sede {
     type Result = ();
 
     fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
-        println!("[sede] Sede Recibe Heartbeat de {}", msg.sede_id);
+        println!("[sede] Recibe Heartbeat de {}", msg.sede_id);
+        println!("[sede] info: {:?}", msg.info);
 
-        println!("{:?}", msg.info);
+        match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == msg.info.sede_id) {
+            Some(known) => *known = msg.info,
+            None => self.sedes_conocidas.push(msg.info),
+        }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,7 +309,7 @@ mod tests {
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
             sedes_conocidas: vec![],
-            mi_info: Arc::new(RwLock::from(dummy_info)),
+            mi_info: dummy_info,
         }
         .start()
     }
@@ -549,27 +577,39 @@ async fn main() {
 
     // sender
     let udp_tx = udp.clone();
-    let sede_info_tx = mi_info.clone();
+    let sede_tx = sede.clone();
     let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect();
     tokio::spawn(async move {
+        let mut bootstrapped = false;
+
         loop {
-            let heartbeat = {
-                let info = sede_info_tx.read().await;
-                serde_json::to_vec(&MsgSedeASede::Heartbeat(Heartbeat { sede_id, info: info.clone() })).unwrap()
+            let info = sede_tx.send(GetInfo).await.unwrap();
+            let known = sede_tx.send(GetSedesConocidas).await.unwrap(); // new message
+
+            let targets: Vec<String> = if !bootstrapped {
+                bootstrapped = true;
+                other_sedes.iter().map(|s| format!("127.0.0.1:700{}", s)).collect()
+            } else {
+                known.iter().map(|s| s.private_addr.clone()).collect()
             };
-            for s in &other_sedes {
-                let addr = format!("127.0.0.1:700{}", s); // was missing
-                udp_tx.send_to(&heartbeat, &addr).await.ok();
+
+            let heartbeat = serde_json::to_vec(
+                &MsgSedeASede::Heartbeat(Heartbeat { sede_id, info })
+            ).unwrap();
+
+            for addr in &targets {
+                udp_tx.send_to(&heartbeat, addr.as_str()).await.ok();
             }
-            tokio::time::sleep(Duration::from_secs(2)).await; // not sleep(2s)
+
+            sleep(Duration::from_secs(2)).await;
         }
     });
 
     loop_pub(sede, public_listener).await;
 }
 
-fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> Arc<RwLock<SedeInfo>> {
-    let mi_info = Arc::new(RwLock::new(SedeInfo {
+fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
+    let mi_info = SedeInfo {
         sede_id,
         coords,
         public_addr: format!("127.0.0.1:808{}", n),
@@ -578,11 +618,11 @@ fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> Arc<RwLock<SedeI
         slots_disponibles: 99,
         conectada: true,
         ultimo_update_ts: timestamp_actual(),
-    }));
+    };
     mi_info
 }
 
-fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), mi_info: Arc<RwLock<SedeInfo>>) -> Addr<Sede> {
+fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), mi_info: SedeInfo) -> Addr<Sede> {
     let sede = Sede {
         sede_id: sede_id,
         coords: coords,

@@ -23,7 +23,6 @@ impl Message for Heartbeat {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-
 pub struct SedeInfo{
     pub sede_id: u32,
     pub coords: (f64, f64),
@@ -46,4 +45,24 @@ pub fn crear_info_dummy() -> SedeInfo {
         conectada: true,
         ultimo_update_ts: timestamp_actual(),
     }
+}
+
+pub struct ActualizarDisponibilidad;
+
+impl Message for ActualizarDisponibilidad {
+    type Result = ();
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+
+pub struct GetInfo;
+
+impl Message for GetInfo {
+    type Result = SedeInfo;
+}
+
+pub struct GetSedesConocidas;
+
+impl Message for GetSedesConocidas {
+    type Result = Vec<SedeInfo>;
 }
