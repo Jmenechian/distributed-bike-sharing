@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use matenmutex::messages::procesadores::MsgProcesador;
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
-use matenmutex::types::{EstadoPago, PagoProcesado, TipoOperacionPago};
+use matenmutex::types::{EstadoPago, EstadoTransaccionPago, PagoProcesado, TipoOperacionPago, TransaccionPago2PC, Voto2PC};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -96,7 +96,7 @@ fn objetivos_para_rol(rol: RolActual, peers: &[SocketAddr], ip: IpAddr) -> Vec<S
     }
 }
 
-/// Sincroniza `mapa` con `objetivos` (siembra nuevos, descarta viejos) y devuelve los cambios vivo/caído.
+/// Sincroniza mapa con objetivos (agrega los nuevos, saca los viejos) y devuelve que cambio entre vivo y caido.
 fn reconciliar_y_detectar(
     mapa: &mut HashMap<SocketAddr, InfoNodo>,
     objetivos: &[SocketAddr],
@@ -132,6 +132,8 @@ struct ProcesadorPagos {
     recibio_ok: Mutex<bool>,
     tiempos: Tiempos,
     pagos_procesados: Mutex<Vec<PagoProcesado>>,
+    #[allow(dead_code)]
+    transacciones_en_curso: Mutex<Vec<TransaccionPago2PC>>,
     rechazar_si_monto_supera: Option<f64>,
 }
 
@@ -161,6 +163,7 @@ impl ProcesadorPagos {
             recibio_ok: Mutex::new(false),
             tiempos: TiemposBuilder::new().build()?,
             pagos_procesados: Mutex::new(Vec::new()),
+            transacciones_en_curso: Mutex::new(Vec::new()),
             rechazar_si_monto_supera: config.rechazar_si_monto_supera,
         })
     }
@@ -214,8 +217,8 @@ impl ProcesadorPagos {
     }
 
     /// Procesa un pago de forma sincronica e idempotente. El lock de
-    /// `pagos_procesados` se toma y se libera enteramente dentro de esta
-    /// funcion (nunca se mantiene a traves de un `.await`).
+    /// pagos_procesados se toma y se libera entero dentro de esta
+    /// funcion, nunca se mantiene a traves de un await.
     fn procesar_pago(&self, msg: MsgSedeAProcesadorPagos) -> MsgProcesadorPagosASede {
         let payment_request_id = msg.payment_request_id().to_string();
         let mut pagos = match self.pagos_procesados.lock() {
@@ -280,9 +283,9 @@ impl ProcesadorPagos {
         }
     }
 
-    /// Construye el `PagoProcesado` a persistir y la respuesta correspondiente,
-    /// aplicando la decision determinista de aceptar/rechazar segun
-    /// `monto_excede_limite`. Comun a las 3 operaciones de pago.
+    /// Arma el PagoProcesado que se va a guardar y la respuesta para la sede,
+    /// decidiendo si se acepta o rechaza segun monto_excede_limite.
+    /// La usan las 3 operaciones de pago.
     fn resolver_operacion(
         &self,
         payment_request_id: &str,
@@ -628,6 +631,77 @@ fn respuesta_desde_pago(pago: &PagoProcesado) -> MsgProcesadorPagosASede {
     }
 }
 
+/// Evento que la maquina de estados 2PC del lider puede aplicar a una TransaccionPago2PC
+/// es un voto recibido de un participante o un timeout.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventoVoto2PC {
+    Voto { votante_id: u32, voto: Voto2PC },
+    Timeout,
+}
+
+/// Decide el EstadoTransaccionPago resultante en funcion de los votos acumulados,
+/// los participantes esperados, y si se aplico un timeout.
+#[allow(dead_code)]
+fn decidir_estado_2pc(tx: &TransaccionPago2PC, timeout: bool) -> EstadoTransaccionPago {
+    if tx.estado == EstadoTransaccionPago::Commit || tx.estado == EstadoTransaccionPago::Abort {
+        return tx.estado;
+    }
+
+    if !tx.votos_abort.is_empty() {
+        return EstadoTransaccionPago::Abort;
+    }
+
+    if timeout {
+        return EstadoTransaccionPago::Abort;
+    }
+
+    let todos_votaron_commit = tx.participantes.iter().all(|p| tx.votos_commit.contains(p));
+    if todos_votaron_commit && !tx.participantes.is_empty() {
+        return EstadoTransaccionPago::Commit;
+    }
+
+    if tx.votos_commit.is_empty() {
+        EstadoTransaccionPago::Preparando
+    } else {
+        EstadoTransaccionPago::Preparada
+    }
+}
+
+/// Guarda el voto en tx y recalcula el estado con decidir_estado_2pc.
+/// Si tx ya esta en Commit o Abort no hace nada.
+/// Si el voto es de alguien que no esta en tx.participantes, se ignora.
+#[allow(dead_code)]
+fn aplicar_evento_2pc(tx: &mut TransaccionPago2PC, evento: EventoVoto2PC) {
+    if tx.estado == EstadoTransaccionPago::Commit || tx.estado == EstadoTransaccionPago::Abort {
+        return;
+    }
+
+    match evento {
+        EventoVoto2PC::Voto { votante_id, voto } => {
+            if !tx.participantes.contains(&votante_id) {
+                return;
+            }
+            match voto {
+                Voto2PC::Commit => {
+                    if !tx.votos_commit.contains(&votante_id) {
+                        tx.votos_commit.push(votante_id);
+                    }
+                }
+                Voto2PC::Abort => {
+                    if !tx.votos_abort.contains(&votante_id) {
+                        tx.votos_abort.push(votante_id);
+                    }
+                }
+            }
+            tx.estado = decidir_estado_2pc(tx, false);
+        }
+        EventoVoto2PC::Timeout => {
+            tx.estado = decidir_estado_2pc(tx, true);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = env::args().collect::<Vec<String>>();
@@ -796,6 +870,7 @@ mod tests {
             recibio_ok: Mutex::new(false),
             tiempos: tiempos_test(),
             pagos_procesados: Mutex::new(Vec::new()),
+            transacciones_en_curso: Mutex::new(Vec::new()),
             rechazar_si_monto_supera: None,
         })
     }
@@ -1131,5 +1206,109 @@ mod tests {
 
         let pagos = nodo.pagos_procesados.lock().unwrap();
         assert_eq!(pagos.len(), 3);
+    }
+
+    fn pago_de_prueba(payment_request_id: &str) -> PagoProcesado {
+        PagoProcesado {
+            payment_request_id: payment_request_id.to_string(),
+            pago_id: "pago-2pc".to_string(),
+            alquiler_id: None,
+            cliente_id: "c-2pc".to_string(),
+            monto: 100.0,
+            tipo: TipoOperacionPago::CobroFinal,
+            estado: EstadoPago::Aceptado,
+        }
+    }
+
+    #[tokio::test]
+    async fn nodo_de_prueba_arranca_con_transacciones_en_curso_vacio() {
+        let nodo = nodo_de_prueba(20, 1, RolActual::Lider).await;
+        let transacciones = nodo.transacciones_en_curso.lock().unwrap();
+        assert!(transacciones.is_empty());
+    }
+
+    #[test]
+    fn voto_unico_commit_decide_commit() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-1".to_string(), pago_de_prueba("pr-sm-1"), vec![1]);
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 1, voto: Voto2PC::Commit });
+
+        assert_eq!(tx.votos_commit, vec![1]);
+        assert!(tx.votos_abort.is_empty());
+        assert_eq!(tx.estado, EstadoTransaccionPago::Commit);
+    }
+
+    #[test]
+    fn un_abort_entre_varios_decide_abort_y_es_terminal() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-2".to_string(), pago_de_prueba("pr-sm-2"), vec![1, 2, 3]);
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 1, voto: Voto2PC::Commit });
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 2, voto: Voto2PC::Abort });
+
+        assert_eq!(tx.votos_commit, vec![1]);
+        assert_eq!(tx.votos_abort, vec![2]);
+        assert_eq!(tx.estado, EstadoTransaccionPago::Abort);
+
+        // El estado abort es terminal: votos posteriores no lo cambian.
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 3, voto: Voto2PC::Commit });
+        assert_eq!(tx.estado, EstadoTransaccionPago::Abort);
+        assert!(!tx.votos_commit.contains(&3));
+    }
+
+    #[test]
+    fn dos_participantes_unanime_commit_decide_commit() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-3".to_string(), pago_de_prueba("pr-sm-3"), vec![1, 2]);
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 1, voto: Voto2PC::Commit });
+        assert_eq!(tx.estado, EstadoTransaccionPago::Preparada);
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 2, voto: Voto2PC::Commit });
+        assert_eq!(tx.votos_commit, vec![1, 2]);
+        assert_eq!(tx.estado, EstadoTransaccionPago::Commit);
+    }
+
+    #[test]
+    fn timeout_antes_de_recibir_todos_los_votos_decide_abort() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-4".to_string(), pago_de_prueba("pr-sm-4"), vec![1, 2]);
+        tx.votos_commit.push(1);
+        tx.estado = EstadoTransaccionPago::Preparada;
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Timeout);
+
+        assert_eq!(tx.estado, EstadoTransaccionPago::Abort);
+    }
+
+    #[test]
+    fn timeout_sobre_transaccion_ya_decidida_es_no_op() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-5".to_string(), pago_de_prueba("pr-sm-5"), vec![1, 2]);
+        tx.votos_commit = vec![1, 2];
+        tx.estado = EstadoTransaccionPago::Commit;
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Timeout);
+
+        assert_eq!(tx.estado, EstadoTransaccionPago::Commit);
+    }
+
+    #[test]
+    fn voto_duplicado_del_mismo_participante_es_idempotente() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-6".to_string(), pago_de_prueba("pr-sm-6"), vec![1, 2]);
+        tx.votos_commit.push(1);
+        tx.estado = EstadoTransaccionPago::Preparada;
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 1, voto: Voto2PC::Commit });
+
+        assert_eq!(tx.votos_commit, vec![1]);
+        assert_eq!(tx.estado, EstadoTransaccionPago::Preparada);
+    }
+
+    #[test]
+    fn voto_de_participante_desconocido_se_ignora() {
+        let mut tx = TransaccionPago2PC::nueva("pr-sm-7".to_string(), pago_de_prueba("pr-sm-7"), vec![1, 2]);
+
+        aplicar_evento_2pc(&mut tx, EventoVoto2PC::Voto { votante_id: 99, voto: Voto2PC::Commit });
+
+        assert!(tx.votos_commit.is_empty());
+        assert!(tx.votos_abort.is_empty());
+        assert_eq!(tx.estado, EstadoTransaccionPago::Preparando);
     }
 }

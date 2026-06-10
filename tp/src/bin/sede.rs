@@ -30,8 +30,7 @@ pub struct Sede {
 }
 
 /// Abre una conexion TCP nueva al ProcesadorPagos, envia un mensaje
-/// JSON-lines y espera la respuesta. Modelado sobre
-/// `enviar_mensaje_a_sede` de cliente.rs.
+/// JSON-lines y espera la respuesta. Es lo mismo que hace enviar_mensaje_a_sede en cliente.rs.
 async fn enviar_a_procesador_pagos(
     addr: &str,
     msg: MsgSedeAProcesadorPagos,
@@ -348,9 +347,8 @@ mod tests {
     }
 
     /// Levanta un ProcesadorPagos de prueba que responde siempre
-    /// `PagoPreAutorizado` (o `PagoRechazado` si `rechazar` es true) a
-    /// cualquier `PreAutorizarPago` recibido. Devuelve la direccion en la
-    /// que escucha.
+    /// PagoPreAutorizado (o PagoRechazado si rechazar es true) a
+    /// cualquier PreAutorizarPago recibido. Devuelve la direccion en la que escucha.
     async fn stub_procesador_pagos(rechazar: bool) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();

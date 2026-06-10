@@ -206,7 +206,7 @@ async fn enviar_mensaje_a_sede(
 
 #[actix_rt::main]
 async fn main() {
-    let mut cliente = Cliente::new(42, (-34.6037, -58.3816), 0);
+    let mut cliente = Cliente::new(42, (-34.6037, -58.3816), 1000);
 
     println!(
         "\n{BOLD_CYAN}=== Mate&Mutex CLI ==={RESET}\n\
