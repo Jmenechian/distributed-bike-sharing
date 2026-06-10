@@ -396,3 +396,17 @@ mod tests {
         assert_eq!(estado_de(&slots[2]).await, "reservado:9-3");
     }
 }
+
+pub struct ActualizarSlots;
+
+impl Message for ActualizarSlots {
+    type Result = ();
+}
+pub struct SetSlotCounts {
+    pub ocupados: u8,
+    pub vacios: u8,
+}
+
+impl Message for SetSlotCounts {
+    type Result = ();
+}
