@@ -18,8 +18,6 @@ use matenmutex::utils::tiempos::{TiemposBuilder, Tiempos};
 const CONFIG_FILE: usize = 1;
 const MINIMAL_LENGTH: usize = 2;
 
-/// Color para resaltar los logs de las fases del 2PC y poder distinguirlos
-/// facilmente del resto de los mensajes (heartbeats, eleccion, etc).
 const COLOR_2PC: &str = "\x1b[36m";
 const COLOR_RESET: &str = "\x1b[0m";
 const PUERTO_BASE: u16 = 6000;
@@ -415,7 +413,7 @@ impl ProcesadorPagos {
         }
     }
 
-    /// Una ida y vuelta TCP de 2PC: abre una conexion nueva, envia `msg` como
+    /// Una ida y vuelta TCP de 2PC: abre una conexion nueva, envia msg como
     /// JSON con salto de linea, y espera una respuesta JSON tambien con salto
     /// de linea, acotada por self.tiempos.espera_ok. Devuelve None ante
     /// fallo de conexion, envio, timeout o deserializacion.
@@ -458,7 +456,7 @@ impl ProcesadorPagos {
         }
     }
 
-    /// Lee mensajes 2PC linea por linea de `socket`, los despacha a
+    /// Lee mensajes 2PC linea por linea de socket, los despacha a
     /// manejar_mensaje_procesador_a_procesador y escribe la respuesta.
     /// Mismo patron que atender_sede.
     async fn atender_procesador(self: Arc<Self>, socket: TcpStream) {
