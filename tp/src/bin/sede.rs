@@ -20,7 +20,7 @@ use std::io::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 
-const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:6001";
+const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
 
 pub struct Sede {
     sede_id: u32,
