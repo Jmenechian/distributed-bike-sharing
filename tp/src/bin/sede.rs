@@ -343,7 +343,7 @@ mod tests {
             sedes_conocidas: vec![],
             sede_info: dummy_info,
         }
-        .start()
+            .start()
     }
 
     fn rellenar_ocupados_vacios_testing(estados: &Vec<EstadoSlot>) -> SedeInfo {
@@ -429,7 +429,7 @@ mod tests {
 
         match respuesta {
             RespuestaSolicitarBici::AlquilerRechazado(_) => {}
-            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_,_) => {
+            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_, _) => {
                 panic!("se esperaba AlquilerRechazado");
             }
         }
@@ -549,10 +549,123 @@ mod tests {
             }
         }
     }
-    
-    
-}
 
+    #[actix_rt::test]
+    async fn solicitar_bici_sin_dinero_rechaza() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+
+        let respuesta = sede.send(SolicitarBici {
+            cliente_id: 1,
+            coords: (-34.2, -58.2),
+            dinero: PREMONTO - 1,
+        }).await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::AlquilerRechazado(_) => {}
+            other => panic!("Se esperaba alquiler rechazaddo por falta de dinero")
+        }
+    }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_con_suficiente_dinero_solo_descuenta_premonto() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+
+        let respuesta = sede.send(SolicitarBici {
+            cliente_id: 1,
+            coords: (-34.2, -58.2),
+            dinero: PREMONTO + 1000,
+        }).await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_, dinero_restante) => {
+                assert_eq!(dinero_restante, 1000, "El saldo devuelto deberia ser 1000");
+            }
+            other => panic!("Se esperaba alquiler confirmado, se obtuvo rechazado")
+        }
+    }
+
+    #[actix_rt::test]
+    async fn devolver_Bici_sin_dinero_suficiente_rechaza() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
+                coords: (0.0, 0.0),
+                dinero: 0,
+
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionRechazada(_) => {}
+            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+                panic!("se esperaba DevolucionRechazada por saldo insuficiente, se obtuvo DevolucionOk");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+        async fn heartbeat_actualiza_sede_ya_conocida_sin_duplicar() {
+            let sede = sede_con_estados(vec![]);
+
+            let mut info_sede_extra1 = crear_info_dummy();
+            info_sede_extra1.sede_id = 99;
+            info_sede_extra1.slots_disponibles = 5;
+
+            sede.send(Heartbeat { sede_id: info_sede_extra1.sede_id, info: info_sede_extra1 })
+                .await
+                .unwrap();
+
+            let mut info_sede_extra2 = crear_info_dummy();
+            info_sede_extra2.sede_id = 99;
+            info_sede_extra2.slots_disponibles = 3;
+
+            sede.send(Heartbeat { sede_id: info_sede_extra2.sede_id, info: info_sede_extra2 })
+                .await
+                .unwrap();
+
+            let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+            assert_eq!(conocidas.len(), 1, "no debe duplicarse la sede al recibir un segundo heartbeat");
+            assert_eq!(conocidas[0].slots_disponibles, 3, "debe reflejar el heartbeat más reciente");
+        }
+
+        #[actix_rt::test]
+        async fn heartbeat_multiples_sedes_distintas_se_registran_por_separado() {
+            let sede = sede_con_estados(vec![]);
+
+            let mut info_sede_extra1 = crear_info_dummy();
+            info_sede_extra1.sede_id = 10;
+
+            let mut info_sede_extra2 = crear_info_dummy();
+            info_sede_extra2.sede_id = 20;
+
+            sede.send(Heartbeat { sede_id: info_sede_extra1.sede_id, info: info_sede_extra1 }).await.unwrap();
+            sede.send(Heartbeat { sede_id: info_sede_extra2.sede_id, info: info_sede_extra2 }).await.unwrap();
+
+            let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+            assert_eq!(conocidas.len(), 2, "deben registrarse dos sedes distintas");
+        }
+
+
+    #[actix_rt::test]
+    async fn heartbeat_agrega_sede_nueva_a_sedes_conocidas() {
+        let sede = sede_con_estados(vec![]);
+
+        let info_remota = crear_info_dummy();
+        sede.send(Heartbeat { sede_id: info_remota.sede_id, info: info_remota.clone() })
+            .await
+            .unwrap();
+
+        let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+        assert_eq!(conocidas.len(), 1, "debe haber exactamente una sede conocida");
+        assert_eq!(conocidas[0].sede_id, info_remota.sede_id);
+    }
+
+}
 
 async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -> String {
     match resultado {
@@ -568,7 +681,10 @@ async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -
             String::from("ERROR:la sede no pudo procesar el mensaje\n")
         }
     }
+
 }
+
+
 
 #[actix_rt::main]
 async fn main() {
