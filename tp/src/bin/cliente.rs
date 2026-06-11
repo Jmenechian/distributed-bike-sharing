@@ -42,8 +42,8 @@ impl Cliente {
     }
 
     fn mostrar_bici(&mut self) {
-        if self.bici_activa.is_some() {
-            println!("[cliente] Mi bici es: {}", self.bici_activa.as_ref().unwrap().bici_id);
+        if let Some(bici) = &self.bici_activa {
+            println!("[cliente] Mi bici es: {}", bici.bici_id);
         } else {
             println!("[cliente] No tengo bici");
         }
@@ -53,9 +53,20 @@ impl Cliente {
         println!("[cliente] Mi dinero es: {}", self.dinero);
     }
 
-    fn recargar_dinero(&mut self, monto: u32) {
-        self.dinero += monto;
+    fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
+        let monto: u32 = monto.parse()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput,format!("'{}' no es un numero valido", monto),)
+            })?;
+
+        self.dinero = self.dinero.checked_add(monto)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput,"La recarga excede el saldo máximo permitido",)
+            })?;
+
         println!("[cliente] Recarga de ${}. Dinero actual: ${}", monto, self.dinero);
+
+        Ok(())
     }
 
     async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
@@ -99,6 +110,11 @@ impl Cliente {
     }
 
     async fn solicitar_bici(&mut self) -> Result<(), io::Error> {
+        if self.bici_activa.is_some() {
+            println!("[cliente] Ya tenes una bici");
+            return Ok(());
+        }
+
         let cliente_id = self.cliente_id;
         let coords = self.coords;
         let dinero = self.dinero;
@@ -169,7 +185,9 @@ impl Cliente {
             return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
 
-        let bici = self.bici_activa.take().unwrap();
+        let bici = self.bici_activa.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver")
+        })?;
         let coords = self.coords;
         let dinero = self.dinero;
         let (writer, reader) = self.validar_conexion()?;
@@ -224,6 +242,7 @@ impl Cliente {
     }
 }
 
+
 async fn enviar_mensaje_a_sede(
     writer: &mut OwnedWriteHalf,
     reader: &mut Lines<BufReader<OwnedReadHalf>>,
@@ -270,7 +289,7 @@ async fn main() {
             ["info_bicis"] => cliente.info_bicis().await,
             ["bici"] => Ok(cliente.mostrar_bici()),
             ["dinero"] => Ok(cliente.mostrar_dinero()),
-            ["recarga", n] => Ok(cliente.recargar_dinero(n.parse().unwrap())),
+            ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
             ["quit"] => break,
             _ => {
