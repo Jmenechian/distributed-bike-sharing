@@ -613,7 +613,7 @@ mod tests {
 
         let respuesta = sede
             .send(DevolverBici {
-                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, timestamp_actual(), String::new()),
                 coords: (-34.6037, -58.3816),
                 dinero: 999999,
             })
