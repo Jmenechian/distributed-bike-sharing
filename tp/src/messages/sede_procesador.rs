@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum MsgSedeAProcesadorPagos {
@@ -31,8 +32,6 @@ impl MsgSedeAProcesadorPagos {
         }
     }
 
-    /// Texto para los logs, mismo formato que usamos para Cliente<->Sede:
-    /// Variante (campo valor, campo valor).
     pub fn describir(&self) -> String {
         match self {
             MsgSedeAProcesadorPagos::PreAutorizarPago { payment_request_id, cliente_id, monto_seguridad } => {
@@ -63,11 +62,10 @@ pub enum MsgProcesadorPagosASede {
     PagoAceptado { payment_request_id: String, pago_id: String },
     PagoReembolsado { payment_request_id: String, pago_id: String },
     PagoRechazado { payment_request_id: String, motivo: String },
+    NoSoyLider { lider_addr: Option<SocketAddr> },
 }
 
 impl MsgProcesadorPagosASede {
-    /// Texto para los logs, mismo formato que usamos para Cliente<->Sede:
-    /// Variante (campo valor, campo valor).
     pub fn describir(&self) -> String {
         match self {
             MsgProcesadorPagosASede::PagoPreAutorizado { payment_request_id, pago_id } => {
@@ -81,6 +79,9 @@ impl MsgProcesadorPagosASede {
             }
             MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo } => {
                 format!("PagoRechazado (payment_request_id {}, motivo {})", payment_request_id, motivo)
+            }
+            MsgProcesadorPagosASede::NoSoyLider { lider_addr } => {
+                format!("NoSoyLider (lider_addr {:?})", lider_addr)
             }
         }
     }
@@ -182,5 +183,22 @@ mod tests {
         let inner = &value["PagoRechazado"];
         assert!(inner.get("payment_request_id").is_some());
         assert!(inner.get("motivo").is_some());
+    }
+
+    #[test]
+    fn no_soy_lider_round_trip_con_addr_none() {
+        let msg = MsgProcesadorPagosASede::NoSoyLider { lider_addr: None };
+        let json = serde_json::to_string(&msg).unwrap();
+        let de: MsgProcesadorPagosASede = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, msg);
+    }
+
+    #[test]
+    fn no_soy_lider_round_trip_con_addr_some() {
+        let addr: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let msg = MsgProcesadorPagosASede::NoSoyLider { lider_addr: Some(addr) };
+        let json = serde_json::to_string(&msg).unwrap();
+        let de: MsgProcesadorPagosASede = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, msg);
     }
 }

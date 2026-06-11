@@ -265,10 +265,10 @@ impl ProcesadorPagos {
             }
         }
 
-        if matches!(self.rol(), Some(RolActual::Lider)) && !self.peers.is_empty() {
-            self.coordinar_2pc_como_lider(msg).await
-        } else {
-            self.procesar_pago_local(&msg)
+        match self.rol() {
+            Some(RolActual::Lider) if !self.peers.is_empty() => self.coordinar_2pc_como_lider(msg).await,
+            Some(RolActual::Lider) => self.procesar_pago_local(&msg), // Caso lider sin replicas configuradas.
+            _ => MsgProcesadorPagosASede::NoSoyLider { lider_addr: None },
         }
     }
 
@@ -1356,6 +1356,39 @@ mod tests {
         assert_eq!(pago.tipo, TipoOperacionPago::PreAutorizacion);
         assert_eq!(pago.estado, EstadoPago::PreAutorizado);
         assert_eq!(pago.monto, 100.0);
+    }
+
+    #[tokio::test]
+    async fn replica_responde_no_soy_lider_y_no_persiste_el_pago() {
+        let nodo = nodo_de_prueba(11, 4, RolActual::Replica { lider_id: 1 }).await;
+
+        let respuesta = nodo
+            .procesar_pago(MsgSedeAProcesadorPagos::PreAutorizarPago {
+                payment_request_id: "pr-replica".to_string(),
+                cliente_id: "c-1".to_string(),
+                monto_seguridad: 100.0,
+            })
+            .await;
+
+        assert_eq!(respuesta, MsgProcesadorPagosASede::NoSoyLider { lider_addr: None });
+        assert!(nodo.pagos_procesados.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidato_responde_no_soy_lider_y_no_persiste_el_pago() {
+        let nodo = nodo_de_prueba(12, 4, RolActual::Candidato).await;
+
+        let respuesta = nodo
+            .procesar_pago(MsgSedeAProcesadorPagos::CobrarPago {
+                payment_request_id: "pr-candidato".to_string(),
+                alquiler_id: "alq-1".to_string(),
+                cliente_id: "c-1".to_string(),
+                monto_final: 50.0,
+            })
+            .await;
+
+        assert_eq!(respuesta, MsgProcesadorPagosASede::NoSoyLider { lider_addr: None });
+        assert!(nodo.pagos_procesados.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
