@@ -511,27 +511,7 @@ impl ProcesadorPagos {
                 })
             }
             MsgProcesadorAProcesador::CommitPago { payment_request_id } => {
-                let pendiente = match self.preparados_replica.lock() {
-                    Ok(mut preparados) => preparados.remove(&payment_request_id),
-                    Err(_) => None,
-                };
-                if let Ok(mut pagos) = self.pagos_procesados.lock() {
-                    if !pagos.iter().any(|p| p.payment_request_id == payment_request_id) {
-                        let pago = match &pendiente {
-                            Some(operacion) => self.decidir_operacion(operacion).0,
-                            None => PagoProcesado {
-                                payment_request_id: payment_request_id.clone(),
-                                pago_id: Uuid::new_v4().to_string(),
-                                alquiler_id: None,
-                                cliente_id: String::new(),
-                                monto: 0.0,
-                                tipo: TipoOperacionPago::CobroFinal,
-                                estado: EstadoPago::Aceptado,
-                            },
-                        };
-                        pagos.push(pago);
-                    }
-                }
+                self.persistir_commit_replica(&payment_request_id);
                 Some(MsgProcesadorAProcesador::AckDecisionPago {
                     payment_request_id,
                     votante_id: self.procesador_id,
@@ -546,7 +526,40 @@ impl ProcesadorPagos {
                     votante_id: self.procesador_id,
                 })
             }
+            MsgProcesadorAProcesador::ConsultarPago { payment_request_id } => {
+                let pago = match self.pagos_procesados.lock() {
+                    Ok(pagos) => pagos.iter().find(|p| p.payment_request_id == payment_request_id).cloned(),
+                    Err(_) => None,
+                };
+                Some(MsgProcesadorAProcesador::RespuestaConsultaPago { payment_request_id, pago })
+            }
             _ => None,
+        }
+    }
+
+    /// Aplica el Commit de payment_request_id: la saca de preparados_replica
+    /// y, si todavia no esta en pagos_procesados, la agrega (idempotente).
+    fn persistir_commit_replica(&self, payment_request_id: &str) {
+        let pendiente = match self.preparados_replica.lock() {
+            Ok(mut preparados) => preparados.remove(payment_request_id),
+            Err(_) => None,
+        };
+        if let Ok(mut pagos) = self.pagos_procesados.lock() {
+            if !pagos.iter().any(|p| p.payment_request_id == payment_request_id) {
+                let pago = match &pendiente {
+                    Some(operacion) => self.decidir_operacion(operacion).0,
+                    None => PagoProcesado {
+                        payment_request_id: payment_request_id.to_string(),
+                        pago_id: Uuid::new_v4().to_string(),
+                        alquiler_id: None,
+                        cliente_id: String::new(),
+                        monto: 0.0,
+                        tipo: TipoOperacionPago::CobroFinal,
+                        estado: EstadoPago::Aceptado,
+                    },
+                };
+                pagos.push(pago);
+            }
         }
     }
 
@@ -905,6 +918,58 @@ impl ProcesadorPagos {
         println!("[{}]: Gane la eleccion: me proclamo LIDER", self.etiqueta());
         let coordinador = MsgProcesador::Coordinador { lider_id: self.procesador_id };
         self.enviar_a(&self.peers, &coordinador).await;
+        self.recuperar_transacciones_huerfanas().await;
+    }
+
+    /// Recorre las transacciones huerfanas en preparados_replica (recibidas
+    /// como PrepararPago pero sin decision, porque el lider anterior murio en
+    /// medio del 2PC) y las resuelve: Commit si self o algun peer vivo ya
+    /// tiene el pago en pagos_procesados, Abort en caso contrario
+    /// (abort-on-doubt). Difunde la decision resultante a los peers vivos.
+    async fn recuperar_transacciones_huerfanas(&self) {
+        let ids: Vec<String> = match self.preparados_replica.lock() {
+            Ok(preparados) => preparados.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+
+        for payment_request_id in ids {
+            let mut hay_commit = match self.pagos_procesados.lock() {
+                Ok(pagos) => pagos.iter().any(|p| p.payment_request_id == payment_request_id),
+                Err(_) => false,
+            };
+
+            let consulta = MsgProcesadorAProcesador::ConsultarPago { payment_request_id: payment_request_id.clone() };
+            for peer in self.peers_vivos() {
+                let peer_id = id_de_addr(&peer);
+                let addr_2pc = addr_2pc_de_id(peer_id, peer.ip());
+                if let Some(MsgProcesadorAProcesador::RespuestaConsultaPago { pago: Some(_), .. }) = self.solicitar_2pc(addr_2pc, &consulta).await {
+                    hay_commit = true;
+                }
+            }
+
+            if hay_commit {
+                self.broadcast_decision_recuperacion(&payment_request_id, EstadoTransaccionPago::Commit).await;
+                self.persistir_commit_replica(&payment_request_id);
+            } else {
+                self.broadcast_decision_recuperacion(&payment_request_id, EstadoTransaccionPago::Abort).await;
+                if let Ok(mut preparados) = self.preparados_replica.lock() {
+                    preparados.remove(&payment_request_id);
+                }
+            }
+        }
+    }
+
+    /// Difunde la decision (CommitPago/AbortPago) de una transaccion recuperada a todos los peers vivos.
+    async fn broadcast_decision_recuperacion(&self, payment_request_id: &str, estado_final: EstadoTransaccionPago) {
+        let decision = match estado_final {
+            EstadoTransaccionPago::Commit => MsgProcesadorAProcesador::CommitPago { payment_request_id: payment_request_id.to_string() },
+            _ => MsgProcesadorAProcesador::AbortPago { payment_request_id: payment_request_id.to_string() },
+        };
+        for peer in self.peers_vivos() {
+            let peer_id = id_de_addr(&peer);
+            let addr_2pc = addr_2pc_de_id(peer_id, peer.ip());
+            let _ = self.solicitar_2pc(addr_2pc, &decision).await;
+        }
     }
 
     /// Responde Ok.
@@ -1943,5 +2008,111 @@ mod tests {
         assert_eq!(r1, r2);
         assert_eq!(lider.pagos_procesados.lock().unwrap().len(), 1);
         assert_eq!(_r1.pagos_procesados.lock().unwrap().len(), 1);
+    }
+
+    // ---- 3c: ConsultarPago / recuperacion de transacciones huerfanas ----
+
+    #[tokio::test]
+    async fn consultar_pago_responde_some_si_esta_committeado() {
+        let nodo = nodo_de_prueba(200, 0, RolActual::Replica { lider_id: 1 }).await;
+        nodo.pagos_procesados.lock().unwrap().push(pago_de_prueba("pr-cons-1"));
+
+        let resp = nodo.manejar_mensaje_procesador_a_procesador(MsgProcesadorAProcesador::ConsultarPago {
+            payment_request_id: "pr-cons-1".to_string(),
+        });
+
+        match resp {
+            Some(MsgProcesadorAProcesador::RespuestaConsultaPago { payment_request_id, pago: Some(pago) }) => {
+                assert_eq!(payment_request_id, "pr-cons-1");
+                assert_eq!(pago.payment_request_id, "pr-cons-1");
+            }
+            otro => panic!("se esperaba RespuestaConsultaPago con Some, se obtuvo {:?}", otro),
+        }
+    }
+
+    #[tokio::test]
+    async fn consultar_pago_responde_none_si_no_esta_committeado() {
+        let nodo = nodo_de_prueba(201, 0, RolActual::Replica { lider_id: 1 }).await;
+
+        let resp = nodo.manejar_mensaje_procesador_a_procesador(MsgProcesadorAProcesador::ConsultarPago {
+            payment_request_id: "pr-cons-2".to_string(),
+        });
+
+        match resp {
+            Some(MsgProcesadorAProcesador::RespuestaConsultaPago { payment_request_id, pago: None }) => {
+                assert_eq!(payment_request_id, "pr-cons-2");
+            }
+            otro => panic!("se esperaba RespuestaConsultaPago con None, se obtuvo {:?}", otro),
+        }
+    }
+
+    #[tokio::test]
+    async fn persistir_commit_replica_es_idempotente_y_remueve_de_preparados() {
+        let nodo = nodo_de_prueba(202, 0, RolActual::Replica { lider_id: 1 }).await;
+        nodo.preparados_replica.lock().unwrap().insert("pr-commit-1".to_string(), cobrar_msg("pr-commit-1", 100.0));
+
+        let resp = nodo.manejar_mensaje_procesador_a_procesador(MsgProcesadorAProcesador::CommitPago {
+            payment_request_id: "pr-commit-1".to_string(),
+        });
+
+        assert!(matches!(resp, Some(MsgProcesadorAProcesador::AckDecisionPago { .. })));
+        assert_eq!(nodo.pagos_procesados.lock().unwrap().len(), 1);
+        assert!(!nodo.preparados_replica.lock().unwrap().contains_key("pr-commit-1"));
+
+        // Idempotencia: un segundo CommitPago no duplica el registro.
+        let resp2 = nodo.manejar_mensaje_procesador_a_procesador(MsgProcesadorAProcesador::CommitPago {
+            payment_request_id: "pr-commit-1".to_string(),
+        });
+        assert!(matches!(resp2, Some(MsgProcesadorAProcesador::AckDecisionPago { .. })));
+        assert_eq!(nodo.pagos_procesados.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recuperacion_huerfana_commitea_si_un_peer_tiene_evidencia() {
+        // 210 se proclama lider con una tx huerfana en preparados_replica;
+        // 211 (peer vivo) ya tiene esa tx en pagos_procesados.
+        let nuevo_lider = nodo_2pc_de_prueba_en_addr_canonica(210, RolActual::Replica { lider_id: 0 }, vec![211], None).await;
+        let _peer = nodo_2pc_de_prueba_en_addr_canonica(211, RolActual::Replica { lider_id: 0 }, vec![], None).await;
+
+        nuevo_lider.preparados_replica.lock().unwrap().insert("pr-orphan-commit".to_string(), cobrar_msg("pr-orphan-commit", 50.0));
+        _peer.pagos_procesados.lock().unwrap().push(pago_de_prueba("pr-orphan-commit"));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        nuevo_lider.proclamarse_lider().await;
+
+        assert!(nuevo_lider.pagos_procesados.lock().unwrap().iter().any(|p| p.payment_request_id == "pr-orphan-commit"));
+        assert!(!nuevo_lider.preparados_replica.lock().unwrap().contains_key("pr-orphan-commit"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recuperacion_huerfana_abortea_si_nadie_tiene_evidencia() {
+        let nuevo_lider = nodo_2pc_de_prueba_en_addr_canonica(220, RolActual::Replica { lider_id: 0 }, vec![221], None).await;
+        let _peer = nodo_2pc_de_prueba_en_addr_canonica(221, RolActual::Replica { lider_id: 0 }, vec![], None).await;
+
+        nuevo_lider.preparados_replica.lock().unwrap().insert("pr-orphan-abort".to_string(), cobrar_msg("pr-orphan-abort", 50.0));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        nuevo_lider.proclamarse_lider().await;
+
+        assert!(!nuevo_lider.pagos_procesados.lock().unwrap().iter().any(|p| p.payment_request_id == "pr-orphan-abort"));
+        assert!(!nuevo_lider.preparados_replica.lock().unwrap().contains_key("pr-orphan-abort"));
+        assert!(_peer.pagos_procesados.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recuperacion_huerfana_es_no_op_si_preparados_replica_esta_vacio() {
+        let nuevo_lider = nodo_2pc_de_prueba_en_addr_canonica(230, RolActual::Replica { lider_id: 0 }, vec![231], None).await;
+        let _peer = nodo_2pc_de_prueba_en_addr_canonica(231, RolActual::Replica { lider_id: 0 }, vec![], None).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        nuevo_lider.proclamarse_lider().await;
+
+        assert!(nuevo_lider.pagos_procesados.lock().unwrap().is_empty());
+        assert!(nuevo_lider.preparados_replica.lock().unwrap().is_empty());
+        assert!(_peer.pagos_procesados.lock().unwrap().is_empty());
+        assert_eq!(rol_de(&nuevo_lider), RolActual::Lider);
     }
 }
