@@ -133,7 +133,7 @@ impl Cliente {
             return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
 
-        let bici = self.bici_activa.take().unwrap();
+        let bici = self.bici_activa.clone().unwrap();
         let coords = self.coords;
         let dinero = self.dinero;
         let (writer, reader) = self.validar_conexion()?;
