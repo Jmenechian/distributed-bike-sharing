@@ -15,7 +15,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede};
+use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, VerificarRoboMasTarde};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
 use std::io;
@@ -206,9 +206,12 @@ impl Sede {
                         let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
                         let _ = sede_addr.send(ActualizarDisponibilidadSolicitar).await;
                         let alquiler = crear_alquilerActivo(&bici);
+                        let alquiler_id = bici.clone().alquiler_id;
                         let _ = sede_addr.send(GuardarAlquiler {alquiler}).await;
-                        dinero -= PREMONTO;
 
+                        sede_addr.do_send(VerificarRoboMasTarde {alquiler_id, slot_idx: idx});
+
+                        dinero -= PREMONTO;
                         RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                     }
                 }
@@ -392,7 +395,26 @@ impl Handler<NotificarDevolucion> for Sede {
     }
 }
 
-
+impl Handler<VerificarRoboMasTarde> for Sede {
+    type Result = ();
+    fn handle(&mut self, msg: VerificarRoboMasTarde, ctx: &mut Context<Self>) -> Self::Result {
+        ctx.run_later(Duration::from_secs(60), move |act, _ctx| {
+            if let Some(alquiler) = act.alquileres_activos
+                .iter_mut()
+                .find(|a| a.alquiler_id == msg.alquiler_id)
+            {
+                match alquiler.estado {
+                    EstadoAlquiler::Activo => {
+                        println!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
+                        alquiler.estado = EstadoAlquiler::RoboConfirmado;
+                        //cobrarle al cliente ->
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+}
 impl Handler<PedirSedes> for Sede {
     type Result = MessageResult<PedirSedes>;
 
@@ -1471,8 +1493,10 @@ async fn main() {
 
 
         loop {
-            //
-            // if estoy_offline {
+
+            // let esta_online = sede_tx.send(EstaOnline).await.unwrap();
+            // if !esta_online { //meh
+            //     sleep(Duration::from_secs(1)).await;
             //     continue;
             // }
 
@@ -1715,9 +1739,14 @@ pub async fn enviar_notificacion( sede_origen_id: u32, info: NotificarDevolucion
         .map_err(|e| e.to_string())
 }
 
+
+// offline
+// ####
 // cliente offline -> solamente peudo conectar_sede cuando estoy en rango
 // pedir_sedes -> tambien solo en rango
 
 // sede -> no heartbeat
 // sede -> no actualizar alquileres
-//
+// ####
+
+// ctx.run_later para bici robada -> bueno

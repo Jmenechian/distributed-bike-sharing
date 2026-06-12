@@ -199,3 +199,12 @@ pub struct AckDevolucion {
     // pub sede_origen_id: u32,
     // pub sede_destino_id: u32,
 }
+
+pub struct VerificarRoboMasTarde {
+    pub alquiler_id: String,
+    pub slot_idx: usize,
+}
+
+impl Message for VerificarRoboMasTarde {
+    type Result = ();
+}
