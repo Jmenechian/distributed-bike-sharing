@@ -1,18 +1,14 @@
-use std::sync::Arc;
 use actix::Message;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use crate::messages::cliente_sede::SolicitarBici;
-use crate::messages::sede_cliente::RespuestaSolicitarBici;
 use crate::types::timestamp_actual;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MsgSedeASede {
     Heartbeat(Heartbeat),
     // HeartbeatAck { sede_id: u32 },
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Heartbeat {
     pub sede_id: u32,
     pub info: SedeInfo,
@@ -22,7 +18,7 @@ impl Message for Heartbeat {
     type Result = ();
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SedeInfo{
     pub sede_id: u32,
     pub coords: (f64, f64),
