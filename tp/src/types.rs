@@ -1,3 +1,5 @@
+use crate::messages::sede_procesador::MsgSedeAProcesadorPagos;
+use crate::messages::sedes::MsgSedeASede;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,7 +17,7 @@ pub struct Bici {
     pub bici_id: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BiciAlquilada {
     pub bici_id: String,
     alquiler_id: String,
@@ -124,6 +126,42 @@ impl TransaccionPago2PC {
             estado: EstadoTransaccionPago::Preparando,
         }
     }
+}
+
+/// Registro durable de un alquiler confirmado (bici entregada al cliente).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AlquilerActivo {
+    pub alquiler_id: String,
+    pub bici: BiciAlquilada,
+    pub slot_idx: usize,
+}
+
+/// Registro durable de una devolucion ya procesada.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DevolucionRecibida {
+    pub alquiler_id: String,
+    pub bici_id: String,
+    pub cliente_id: String,
+    pub slot_idx: usize,
+    pub fin_ts: u64,
+    pub monto_cobrado: u32,
+}
+
+/// Registro durable de un pago pendiente de confirmacion/retry con el ProcesadorPagos.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PagoPendiente {
+    pub payment_request_id: String,
+    pub alquiler_id: Option<String>,
+    pub cliente_id: String,
+    pub mensaje: MsgSedeAProcesadorPagos,
+}
+
+/// Registro durable de una notificacion pendiente de entrega a otra Sede.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NotificacionPendiente {
+    pub id: String,
+    pub destino_sede_id: u32,
+    pub mensaje: MsgSedeASede,
 }
 
 #[cfg(test)]
@@ -266,5 +304,67 @@ mod tests_pagos {
         assert!(tx.votos_commit.is_empty());
         assert!(tx.votos_abort.is_empty());
         assert_eq!(tx.participantes, vec![1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod tests_persistencia_sede {
+    use super::*;
+    use crate::messages::sedes::{crear_info_dummy, Heartbeat, MsgSedeASede};
+
+    #[test]
+    fn alquiler_activo_round_trip() {
+        let alquiler = AlquilerActivo {
+            alquiler_id: "alq-1".to_string(),
+            bici: BiciAlquilada::new("1-1".to_string(), "alq-1".to_string(), "c-1".to_string(), 1, 1000, "token".to_string()),
+            slot_idx: 2,
+        };
+        let json = serde_json::to_string(&alquiler).unwrap();
+        let de: AlquilerActivo = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, alquiler);
+    }
+
+    #[test]
+    fn devolucion_recibida_round_trip() {
+        let devolucion = DevolucionRecibida {
+            alquiler_id: "alq-1".to_string(),
+            bici_id: "1-1".to_string(),
+            cliente_id: "c-1".to_string(),
+            slot_idx: 2,
+            fin_ts: 2000,
+            monto_cobrado: 150,
+        };
+        let json = serde_json::to_string(&devolucion).unwrap();
+        let de: DevolucionRecibida = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, devolucion);
+    }
+
+    #[test]
+    fn pago_pendiente_round_trip() {
+        let pago = PagoPendiente {
+            payment_request_id: "pr-1".to_string(),
+            alquiler_id: Some("alq-1".to_string()),
+            cliente_id: "c-1".to_string(),
+            mensaje: MsgSedeAProcesadorPagos::PreAutorizarPago {
+                payment_request_id: "pr-1".to_string(),
+                cliente_id: "c-1".to_string(),
+                monto_seguridad: 100.0,
+            },
+        };
+        let json = serde_json::to_string(&pago).unwrap();
+        let de: PagoPendiente = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, pago);
+    }
+
+    #[test]
+    fn notificacion_pendiente_round_trip() {
+        let notif = NotificacionPendiente {
+            id: "n-1".to_string(),
+            destino_sede_id: 2,
+            mensaje: MsgSedeASede::Heartbeat(Heartbeat { sede_id: 1, info: crear_info_dummy() }),
+        };
+        let json = serde_json::to_string(&notif).unwrap();
+        let de: NotificacionPendiente = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, notif);
     }
 }
