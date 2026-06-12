@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/target/
+
+# IDE - JetBrains
+.idea/
+
+# Env
+.env
+**/.env
+
+# OS
+.DS_Store
