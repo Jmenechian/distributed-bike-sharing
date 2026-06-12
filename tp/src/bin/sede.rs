@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
 use matenmutex::messages::sedes::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
@@ -221,6 +221,28 @@ impl Sede {
 
 impl Actor for Sede {
     type Context = Context<Self>;
+
+    /// Arranca el monitor de liveness: cada MONITOR_INTERVAL revisa las sedes conocidas
+    /// y marca como caidas las que no mandan heartbeat hace mas de LIVENESS_TIMEOUT.
+    fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.run_interval(Duration::from_secs(MONITOR_INTERVAL), |sede, _ctx| {
+            sede.marcar_sedes_caidas();
+        });
+    }
+}
+
+impl Sede {
+    /// Marca conectada=false a las sedes sin heartbeat reciente. Loguea solo la transicion vivo->caido.
+    fn marcar_sedes_caidas(&mut self) {
+        let ahora = timestamp_actual();
+        for sede in self.sedes_conocidas.iter_mut() {
+            let vencida = ahora.saturating_sub(sede.ultimo_update_ts) > LIVENESS_TIMEOUT;
+            if vencida && sede.conectada {
+                sede.conectada = false;
+                println!("[sede {}]: la sede {} se considera CAIDA (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
+            }
+        }
+    }
 }
 
 impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
@@ -496,9 +518,19 @@ impl Handler<Heartbeat> for Sede {
         println!("[sede] Recibe Heartbeat de {}", msg.sede_id);
         println!("[sede] info: {:?}", msg.info); //para debug
 
-        match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == msg.info.sede_id) {
-            Some(sedes) => *sedes = msg.info,
-            None => self.sedes_conocidas.push(msg.info),
+        let mut info = msg.info;
+        // Liveness con hora local: "lo escuche recien", no la auto-reportada del emisor.
+        info.ultimo_update_ts = timestamp_actual();
+        info.conectada = true;
+
+        match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == info.sede_id) {
+            Some(sede) => {
+                if !sede.conectada {
+                    println!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
+                }
+                *sede = info;
+            }
+            None => self.sedes_conocidas.push(info),
         }
     }
 }
