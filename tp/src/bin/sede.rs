@@ -4,8 +4,10 @@ use matenmutex::slot;
 use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs::File;
+use std::io::BufReader as StdBufReader;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
@@ -22,6 +24,14 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
+const CONFIG_FILE: usize = 1;
+
+#[derive(Deserialize)]
+struct SedeConfig {
+    id: u32,
+    coord_x: f64,
+    coord_y: f64,
+}
 
 pub struct Sede {
     sede_id: u32,
@@ -1199,8 +1209,8 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let args: Vec<String> = env::args().collect();
-    let n = match numero_de_sede(args) {
-        Some(sede) => sede,
+    let config = match cargar_config(args) {
+        Some(c) => c,
         None => return,
     };
 
@@ -1209,10 +1219,11 @@ async fn main() {
         None => return,
     };
 
-    let sede_id = n as u32;
+    let sede_id = config.id;
+    let n = config.id as u16;
     let num_slots = 20;
     let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
-    let coords = (-34.6037, -58.3816); //ver dps cambiar coords
+    let coords = (config.coord_x, config.coord_y);
 
     let sede_info = crear_sede_info(n, sede_id, coords);
 
@@ -1329,15 +1340,28 @@ fn cargar_token_secret() -> Option<[u8; 32]> {
     Some(token_secret)
 }
 
-fn numero_de_sede(args: Vec<String>) -> Option<u16> {
-    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
-        Some(n) => n,
+fn cargar_config(args: Vec<String>) -> Option<SedeConfig> {
+    let path = match args.get(CONFIG_FILE) {
+        Some(p) => p,
         None => {
-            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
+            eprintln!("Uso: cargo run --bin sede <path/a/config.json>");
             return None;
         }
     };
-    Some(n)
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error al abrir la config '{path}': {e}");
+            return None;
+        }
+    };
+    match serde_json::from_reader(StdBufReader::new(file)) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            eprintln!("Error al parsear la config '{path}': {e}");
+            None
+        }
+    }
 }
 
 async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {

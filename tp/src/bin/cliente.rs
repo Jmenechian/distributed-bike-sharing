@@ -2,7 +2,11 @@ use actix::{Actor, Context};
 use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
+use serde::Deserialize;
+use std::env;
+use std::fs::File;
 use std::io;
+use std::io::BufReader as StdBufReader;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -13,6 +17,15 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const BOLD_CYAN: &str = "\x1b[1;36m";
+const CONFIG_FILE: usize = 1;
+
+#[derive(Deserialize)]
+struct ClienteConfig {
+    cliente_id: u32,
+    coord_x: f64,
+    coord_y: f64,
+    dinero: u32,
+}
 
 pub struct Cliente {
     cliente_id: u32,
@@ -40,6 +53,13 @@ impl Cliente {
             sedes_conocidas: vec![],
         }
     }
+
+    fn from_json(file_path: &str) -> Result<Cliente, Box<dyn std::error::Error>> {
+        let file = File::open(file_path)?;
+        let config: ClienteConfig = serde_json::from_reader(StdBufReader::new(file))?;
+        Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero))
+    }
+
     fn actualizar_posicion(&mut self, str_x: &str, str_y: &str) -> Result<(), io::Error> {
         let x = str_x.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada x invalida: '{str_x}' debe representar un número.")))?;
         let y = str_y.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada y invalida: '{str_y}' debe representar un número.")))?;
@@ -270,20 +290,20 @@ async fn enviar_mensaje_a_sede(
 
 #[actix_rt::main]
 async fn main() {
-    let mut cliente = Cliente::new(42, (-34.6037, -58.3816), 1000);
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        println!("Uso: cargo run --bin cliente <path/a/config.json>");
+        return;
+    }
+    let mut cliente = match Cliente::from_json(&args[CONFIG_FILE]) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error al cargar la config: {e}");
+            return;
+        }
+    };
 
-    println!(
-        "\n{BOLD_CYAN}=== Mate&Mutex CLI ==={RESET}\n\
-         {BOLD}Comandos disponibles:{RESET}\n\
-         {GREEN}  actualizar_posicion <x> <y> {RESET}   - Moverse una distancia\n\
-         {GREEN}  conectar_sede <n>{RESET}              - Conectar a una sede\n\
-         {GREEN}  solicitar_bici{RESET}                 - Solicitar una bici\n\
-         {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
-         {GREEN}  info_bicis{RESET}                     - Ver bicis disponibles\n\
-         {GREEN}  recarga <n>{RESET}                    - Recargar dinero\n\
-         {GREEN}  pedir_sedes{RESET}                    - Pide Sede Cercanas\n\
-         {GREEN}  quit{RESET}                           - Salir\n"
-        );
+    listar_comandos();
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -313,6 +333,21 @@ async fn main() {
             println!("Error: {}", e);
         }
     }
+}
+
+fn listar_comandos() {
+    println!(
+        "\n{BOLD_CYAN}=== Mate&Mutex CLI ==={RESET}\n\
+         {BOLD}Comandos disponibles:{RESET}\n\
+         {GREEN}  actualizar_posicion <x> <y> {RESET}   - Moverse una distancia\n\
+         {GREEN}  conectar_sede <n>{RESET}              - Conectar a una sede\n\
+         {GREEN}  solicitar_bici{RESET}                 - Solicitar una bici\n\
+         {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
+         {GREEN}  info_bicis{RESET}                     - Ver bicis disponibles\n\
+         {GREEN}  recarga <n>{RESET}                    - Recargar dinero\n\
+         {GREEN}  pedir_sedes{RESET}                    - Pide Sede Cercanas\n\
+         {GREEN}  quit{RESET}                           - Salir\n"
+    );
 }
 
 #[cfg(test)]
