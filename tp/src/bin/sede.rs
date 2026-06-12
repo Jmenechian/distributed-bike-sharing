@@ -1,20 +1,21 @@
-use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, ResponseFuture};
-use matenmutex::messages::cliente_sede::{
-    AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
-};
+use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::slot;
-use matenmutex::slot::{AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, Slot};
+use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
 use serde::Serialize;
 use std::env;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
+use matenmutex::messages::sedes::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
-use matenmutex::common::{DISTANCIA_MINIMA, PREMONTO, TASA};
 use std::io;
 use std::io::Error;
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,8 @@ pub struct Sede {
     slots: Vec<Addr<Slot>>,
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
+    sedes_conocidas: Vec<SedeInfo>,
+    sede_info: SedeInfo,
     procesador_pagos_addrs: Vec<String>,
     lider_cacheado: Arc<Mutex<Option<String>>>,
 }
@@ -116,17 +119,11 @@ async fn enviar_a_procesador_pagos(
 
 impl Sede {
     fn cliente_en_rango(&self, coords: (f64, f64)) -> bool {
-        self.calcular_distancia(coords) <= DISTANCIA_MINIMA
+        calcular_distancia(self.coords, coords) <= DISTANCIA_MINIMA
     }
 
     fn cliente_tiene_dinero_solicitar(&self, dinero: u32) -> bool {
         dinero > PREMONTO
-    }
-    fn calcular_distancia(&self, coords: (f64, f64)) -> f64 {
-        let (coords_sede_x, coords_sede_y) = self.coords;
-        let (coords_cliente_x, coords_cliente_y) = coords;
-
-        ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
     }
 
     fn generar_comprobante(sede_id: u32, cliente_id: u32, token_secret: &[u8; 32], bici_id: String) -> Result<BiciAlquilada, token::TokenError> {
@@ -186,7 +183,9 @@ impl Sede {
                     Ok(bici) => {
                         println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                         let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
+                        let _ = sede_addr.send(ActualizarDisponibilidadSolicitar).await;
                         dinero -= PREMONTO;
+
                         RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
                     }
                 }
@@ -214,12 +213,54 @@ impl Actor for Sede {
     type Context = Context<Self>;
 }
 
+impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ActualizarDisponibilidadSolicitar, _ctx: &mut Self::Context) -> Self::Result {
+        self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_sub(1);
+        self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_add(1);
+        self.sede_info.ultimo_update_ts = timestamp_actual();
+    }
+}
+
+impl Handler<ActualizarDisponibilidadDevolver> for Sede { //maybe algo que revise los slots? por ahora bien basicon
+    type Result = ();
+
+    fn handle(&mut self, msg: ActualizarDisponibilidadDevolver, ctx: &mut Self::Context) -> Self::Result {
+        self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_add(1);
+        self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_sub(1);
+        self.sede_info.ultimo_update_ts = timestamp_actual();
+    }
+}
+impl Handler<GetInfo> for Sede {
+    type Result = MessageResult<GetInfo>;
+
+    fn handle(&mut self, _msg: GetInfo, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.sede_info.clone())
+    }
+}
+
+impl Handler<GetSedesConocidas> for Sede {
+    type Result = MessageResult<GetSedesConocidas>;
+
+    fn handle(&mut self, _msg: GetSedesConocidas, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.sedes_conocidas.clone())
+    }
+}
+
+impl Handler<PedirSedes> for Sede {
+    type Result = MessageResult<PedirSedes>;
+
+    fn handle(&mut self, _msg: PedirSedes, _ctx: &mut Self::Context) -> Self::Result {
+        let mut sedes_conocidas = self.sedes_conocidas.clone();
+        sedes_conocidas.push(self.sede_info.clone());
+         MessageResult(sedes_conocidas.clone())
+    }
+}
 impl Handler<SolicitarBici> for Sede {
     type Result = ResponseFuture<RespuestaSolicitarBici>;
 
     fn handle(&mut self, msg: SolicitarBici, ctx: &mut Context<Self>) -> Self::Result {
-        println!("Hola Bici");
-
         if !self.cliente_en_rango(msg.coords) {
             let motivo = String::from("Para poder tomar la bici debe estar mas cerca de la sede");
             println!("[sede] Envia AlquilerRechazado: {}", motivo);
@@ -264,6 +305,39 @@ impl Handler<SolicitarBici> for Sede {
     }
 }
 
+impl Handler<ActualizarSlots> for Sede {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, _msg: ActualizarSlots, ctx: &mut Context<Self>) -> Self::Result {
+        let requests: Vec<_> = self
+            .slots
+            .iter()
+            .map(|slot| slot.send(ConsultarBici))
+            .collect();
+
+        let addr = ctx.address(); // clonable, se puede mover al async block
+
+        Box::pin(async move {
+            let resultados = futures::future::join_all(requests).await;
+            let lineas: Vec<String> = resultados.into_iter().filter_map(|r| r.ok()).collect();
+            let total = lineas.len();
+            let ocupados = lineas.iter().filter(|l| !l.contains("sin bici")).count();
+            let vacios = total - ocupados;
+
+            addr.do_send(SetSlotCounts { ocupados: ocupados as u8, vacios: vacios as u8 });
+        })
+    }
+}
+
+impl Handler<SetSlotCounts> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: SetSlotCounts, _ctx: &mut Context<Self>) {
+        self.sede_info.slots_disponibles = msg.ocupados;
+        self.sede_info.slots_vacios = msg.vacios;
+    }
+}
+
 struct GuardarReserva {
     alquiler_id: String,
     slot_idx: usize,
@@ -304,9 +378,7 @@ impl Handler<AckComprobanteAlquiler> for Sede {
 impl Handler<DevolverBici> for Sede {
     type Result = ResponseFuture<RespuestaDevolverBici>;
 
-    fn handle(&mut self, msg: DevolverBici, _ctx: &mut Context<Self>) -> Self::Result {
-        println!("Chau Bici");
-
+    fn handle(&mut self, msg: DevolverBici, ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
             let motivo = String::from("Para poder devolver la bici debe estar mas cerca de la sede");
             println!("[sede] Envia DevolucionRechazada: {}", motivo);
@@ -326,6 +398,7 @@ impl Handler<DevolverBici> for Sede {
 
         let slots = self.slots.clone();
         let bici_id = msg.bici.bici_id().to_string();
+        let sede_addr = ctx.address();
         let procesador_pagos_addrs = self.procesador_pagos_addrs.clone();
         let lider_cacheado = self.lider_cacheado.clone();
         let alquiler_id = msg.bici.alquiler_id().to_string();
@@ -355,7 +428,10 @@ impl Handler<DevolverBici> for Sede {
 
             for slot in slots.iter() {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
-                    Ok(true) => { return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto); } 
+                    Ok(true) => {
+                        let _ = sede_addr.send(ActualizarDisponibilidadDevolver).await;
+                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto);
+                    }
                     _ => continue,
                 }
             }
@@ -382,6 +458,7 @@ impl Handler<PreguntarBicis> for Sede {
     type Result = ResponseFuture<String>;
 
     fn handle(&mut self, _msg: PreguntarBicis, _ctx: &mut Context<Self>) -> Self::Result {
+
         let requests: Vec<_> = self
             .slots
             .iter()
@@ -402,11 +479,27 @@ impl Handler<PreguntarBicis> for Sede {
     }
 }
 
+impl Handler<Heartbeat> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
+        println!("[sede] Recibe Heartbeat de {}", msg.sede_id);
+        println!("[sede] info: {:?}", msg.info); //para debug
+
+        match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == msg.info.sede_id) {
+            Some(sedes) => *sedes = msg.info,
+            None => self.sedes_conocidas.push(msg.info),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use matenmutex::common::MAX_VALUE;
     use super::*;
     use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+    use matenmutex::messages::sedes::crear_info_dummy;
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
@@ -475,17 +568,36 @@ mod tests {
     }
 
     fn sede_con_estados_y_procesador(estados: Vec<EstadoSlot>, procesador_pagos_addr: String) -> Addr<Sede> {
+        let dummy_info = rellenar_ocupados_vacios_testing(&estados);
+
         let slots = crear_slots_con_estados(estados);
+
         Sede {
             sede_id: 1,
             coords: (-34.6037, -58.3816),
             slots,
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
+            sedes_conocidas: vec![],
+            sede_info: dummy_info,
             procesador_pagos_addrs: vec![procesador_pagos_addr],
             lider_cacheado: Arc::new(Mutex::new(None)),
         }
-        .start()
+            .start()
+    }
+
+    fn rellenar_ocupados_vacios_testing(estados: &Vec<EstadoSlot>) -> SedeInfo {
+        let ocupados = estados.iter()
+            .filter(|e| matches!(e, EstadoSlot::Disponible { .. }))
+            .count() as u8;
+        let vacios = estados.iter()
+            .filter(|e| matches!(e, EstadoSlot::Vacio))
+            .count() as u8;
+
+        let mut dummy_info = crear_info_dummy();
+        dummy_info.slots_disponibles = ocupados;
+        dummy_info.slots_vacios = vacios;
+        dummy_info
     }
 
     #[actix_rt::test]
@@ -505,7 +617,7 @@ mod tests {
             .send(SolicitarBici {
                 cliente_id: 42,
                 coords: (-34.6037, -58.3816),
-                dinero: 999999,
+                dinero: MAX_VALUE,
             })
             .await
             .unwrap();
@@ -558,7 +670,7 @@ mod tests {
 
         match respuesta {
             RespuestaSolicitarBici::AlquilerRechazado(_) => {}
-            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_,_) => {
+            RespuestaSolicitarBici::AlquilerConfirmado(_) | RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_, _) => {
                 panic!("se esperaba AlquilerRechazado");
             }
         }
@@ -615,7 +727,7 @@ mod tests {
             .send(DevolverBici {
                 bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, timestamp_actual(), String::new()),
                 coords: (-34.6037, -58.3816),
-                dinero: 999999,
+                dinero: MAX_VALUE,
             })
             .await
             .unwrap();
@@ -717,6 +829,93 @@ mod tests {
             }
         }
     }
+
+    #[actix_rt::test]
+    async fn solicitar_bici_sin_dinero_rechaza() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+
+        let respuesta = sede.send(SolicitarBici {
+            cliente_id: 1,
+            coords: (-34.2, -58.2),
+            dinero: PREMONTO - 1,
+        }).await
+            .unwrap();
+
+        match respuesta {
+            RespuestaSolicitarBici::AlquilerRechazado(_) => {}
+            other => panic!("Se esperaba alquiler rechazaddo por falta de dinero")
+        }
+    }
+
+    // #[actix_rt::test]
+    // async fn solicitar_bici_con_suficiente_dinero_solo_descuenta_premonto() {
+    //     let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+    //
+    //     let respuesta = sede.send(SolicitarBici {
+    //         cliente_id: 1,
+    //         coords: (-34.2, -58.2),
+    //         dinero: PREMONTO + 1000,
+    //     }).await
+    //         .unwrap();
+    //
+    //     match respuesta {
+    //         RespuestaSolicitarBici::ComprobanteAlquilerEmitido(_, dinero_restante) => {
+    //             assert_eq!(dinero_restante, 1000, "El saldo devuelto deberia ser 1000");
+    //         }
+    //         other => panic!("Se esperaba alquiler confirmado, se obtuvo rechazado")
+    //     }
+    // }
+    // [sede] Envia PreAutorizarPago (payment_request_id e2ef2263-4689-4b71-aac4-06e6985d8efe, cliente_id 1, monto_seguridad 150)
+    // [sede] Error comunicandose con el procesador de pagos: no se encontro lider de pagos
+
+
+
+    #[actix_rt::test]
+    async fn devolver_Bici_sin_dinero_suficiente_rechaza() {
+        let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
+
+        let respuesta = sede
+            .send(DevolverBici {
+                bici: BiciAlquilada::new("9-9".to_string(), String::new(), String::new(), 1, 0, String::new()),
+                coords: (0.0, 0.0),
+                dinero: 0,
+
+            })
+            .await
+            .unwrap();
+
+        match respuesta {
+            RespuestaDevolverBici::DevolucionRechazada(_) => {}
+            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+                panic!("se esperaba DevolucionRechazada por saldo insuficiente, se obtuvo DevolucionOk");
+            }
+        }
+    }
+
+    #[actix_rt::test]
+        async fn heartbeat_actualiza_sede_ya_conocida_sin_duplicar() {
+            let sede = sede_con_estados(vec![]);
+
+            let mut info_sede_extra1 = crear_info_dummy();
+            info_sede_extra1.sede_id = 99;
+            info_sede_extra1.slots_disponibles = 5;
+
+            sede.send(Heartbeat { sede_id: info_sede_extra1.sede_id, info: info_sede_extra1 })
+                .await
+                .unwrap();
+
+            let mut info_sede_extra2 = crear_info_dummy();
+            info_sede_extra2.sede_id = 99;
+            info_sede_extra2.slots_disponibles = 3;
+
+            sede.send(Heartbeat { sede_id: info_sede_extra2.sede_id, info: info_sede_extra2 })
+                .await
+                .unwrap();
+
+            let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+            assert_eq!(conocidas.len(), 1, "no debe duplicarse la sede al recibir un segundo heartbeat");
+            assert_eq!(conocidas[0].slots_disponibles, 3, "debe reflejar el heartbeat más reciente");
+        }
 
     #[actix_rt::test]
     async fn solicitar_bici_con_preautorizacion_aceptada_emite_comprobante() {
@@ -942,6 +1141,38 @@ impl Handler<ConsultarEstadoSlot> for Sede {
         Box::pin(async move { slot.send(Reservar).await.unwrap_or(ResultadoReserva::Rechazada) })
     }
 }
+    //
+    //     #[actix_rt::test]
+    //     async fn heartbeat_multiples_sedes_distintas_se_registran_por_separado() {
+    //         let sede = sede_con_estados(vec![]);
+    //
+    //         let mut info_sede_extra1 = crear_info_dummy();
+    //         info_sede_extra1.sede_id = 10;
+    //
+    //         let mut info_sede_extra2 = crear_info_dummy();
+    //         info_sede_extra2.sede_id = 20;
+    //
+    //         sede.send(Heartbeat { sede_id: info_sede_extra1.sede_id, info: info_sede_extra1 }).await.unwrap();
+    //         sede.send(Heartbeat { sede_id: info_sede_extra2.sede_id, info: info_sede_extra2 }).await.unwrap();
+    //
+    //         let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+    //         assert_eq!(conocidas.len(), 2, "deben registrarse dos sedes distintas");
+    //     }
+    //
+    //
+    // #[actix_rt::test]
+    // async fn heartbeat_agrega_sede_nueva_a_sedes_conocidas() {
+    //     let sede = sede_con_estados(vec![]);
+    //
+    //     let info_remota = crear_info_dummy();
+    //     sede.send(Heartbeat { sede_id: info_remota.sede_id, info: info_remota.clone() })
+    //         .await
+    //         .unwrap();
+    //
+    //     let conocidas = sede.send(GetSedesConocidas).await.unwrap();
+    //     assert_eq!(conocidas.len(), 1, "debe haber exactamente una sede conocida");
+    //     assert_eq!(conocidas[0].sede_id, info_remota.sede_id);
+    // }
 
 
 async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -> String {
@@ -958,62 +1189,160 @@ async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -
             String::from("ERROR:la sede no pudo procesar el mensaje\n")
         }
     }
+
 }
+
+
 
 #[actix_rt::main]
 async fn main() {
     dotenvy::dotenv().ok();
 
     let args: Vec<String> = env::args().collect();
-    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
-        Some(n) => n,
-        None => {
-            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
-            return;
-        }
+    let n = match numero_de_sede(args) {
+        Some(sede) => sede,
+        None => return,
     };
 
-    let token_secret_raw = match env::var("TOKEN_SECRET") {
-        Ok(raw) => raw,
-        Err(_) => {
-            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
-            return;
-        }
+    let token_secret = match cargar_token_secret() {
+        Some(token) => token,
+        None => return,
     };
-    let token_secret = token::cargar_secret(&token_secret_raw);
 
     let sede_id = n as u32;
     let num_slots = 20;
     let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
+    let coords = (-34.6037, -58.3816); //ver dps cambiar coords
+
+    let sede_info = crear_sede_info(n, sede_id, coords);
+
 
     let procesador_pagos_addrs = parsear_addrs_procesador_pagos(
         env::var("PROCESADOR_PAGOS_ADDRS").ok().as_deref(),
         env::var("PROCESADOR_PAGOS_ADDR").ok().as_deref(),
     );
 
+
+    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info, procesador_pagos_addrs);
+    sede.do_send(ActualizarSlots);
+
+    let public_addr = format!("127.0.0.1:808{}", n);
+    let private_addr = format!("127.0.0.1:700{}", n);
+
+    let public_listener = TcpListener::bind(&public_addr).await.unwrap();
+    let udp = Arc::new(UdpSocket::bind(&private_addr).await.unwrap());
+
+    println!("Sede {} — publica: {}, interna: {}", n, public_addr, private_addr);
+
+    // receiver
+    let udp_rx = udp.clone();
+    let sede_rx = sede.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let (len, peer) = match udp_rx.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => { eprintln!("UDP recv error: {}", e); continue; }
+            };
+            match serde_json::from_slice::<MsgSedeASede>(&buf[..len]) {
+                Ok(MsgSedeASede::Heartbeat(msg)) => {
+                    sede_rx.send(msg).await.ok();
+                }
+                Err(e) => eprintln!("UDP parse error from {}: {}", peer, e),
+            }
+        }
+    });
+
+    // sender
+    let udp_tx = udp.clone();
+    let sede_tx = sede.clone();
+    let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
+    tokio::spawn(async move {
+        let mut bootstrapped = false; //para no pegarle a todos lados
+
+        loop {
+            let info = sede_tx.send(GetInfo).await.unwrap();
+            let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
+
+            let targets: Vec<String> = if !bootstrapped {
+                bootstrapped = true;
+                other_sedes.iter().map(|s| format!("127.0.0.1:700{}", s)).collect()
+            } else {
+                sedes_conocidas.iter().map(|s| s.private_addr.clone()).collect()
+            };
+
+            let heartbeat = serde_json::to_vec(
+                &MsgSedeASede::Heartbeat(Heartbeat { sede_id, info })
+            ).unwrap();
+
+
+
+            for addr in &targets {
+                udp_tx.send_to(&heartbeat, addr.as_str()).await.ok();
+            }
+
+            sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
+        }
+    });
+
+    loop_pub(sede, public_listener).await;
+}
+
+fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
+    SedeInfo {
+        sede_id,
+        coords,
+        public_addr: format!("127.0.0.1:808{}", n),
+        private_addr: format!("127.0.0.1:700{}", n),
+        slots_vacios: 99,
+        slots_disponibles: 99,
+        conectada: true,
+        ultimo_update_ts: timestamp_actual(),
+    }
+}
+
+fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), sede_info: SedeInfo, procesador_pagos_addrs: Vec<String>) -> Addr<Sede> {
     let sede = Sede {
-        sede_id: sede_id,
-        coords: (-34.6037, -58.3816),
-        slots: slots,
+        sede_id,
+        coords,
+        slots,
         token_secret,
         pending_reservas: std::collections::HashMap::new(),
         procesador_pagos_addrs,
         lider_cacheado: Arc::new(Mutex::new(None)),
+        sedes_conocidas: vec![],
+        sede_info,
     }
-    .start();
+        .start();
+    sede
+}
 
-    let addr = format!("127.0.0.1:808{}", n);
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("No se pudo iniciar la sede en {}: {}", addr, e);
-            return;
+fn cargar_token_secret() -> Option<[u8; 32]> {
+    let token_secret_raw = match env::var("TOKEN_SECRET") {
+        Ok(raw) => raw,
+        Err(_) => {
+            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
+            return None;
         }
     };
-    println!("Sede {}, puerto {}", n, addr);
+    let token_secret = token::cargar_secret(&token_secret_raw);
+    Some(token_secret)
+}
 
+fn numero_de_sede(args: Vec<String>) -> Option<u16> {
+    let n: u16 = match args.get(1).and_then(|arg| arg.parse().ok()) {
+        Some(n) => n,
+        None => {
+            eprintln!("Uso: sede <n> — <n> debe ser un numero de puerto valido (u16)");
+            return None;
+        }
+    };
+    Some(n)
+}
+
+async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
     loop {
-        let (socket, addr) = match listener.accept().await {
+        let (socket, addr) = match public_listener.accept().await {
             Ok(conexion) => conexion,
             Err(e) => {
                 eprintln!("Error aceptando conexion entrante: {}", e);
@@ -1041,6 +1370,9 @@ async fn main() {
                     Ok(MsgClienteASede::PreguntarBicis(msg)) => {
                         formatear_respuesta(sede.send(msg).await).await
                     }
+                    Ok(MsgClienteASede::PedirSedes(msg)) => {
+                        formatear_respuesta(sede.send(msg).await).await
+                    }
                     Err(_) => format!("UNKNOWN:{}\n", line.trim()),
                 };
 
@@ -1053,3 +1385,4 @@ async fn main() {
         });
     }
 }
+
