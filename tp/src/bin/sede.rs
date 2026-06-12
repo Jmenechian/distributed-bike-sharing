@@ -15,12 +15,12 @@ use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sedes::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, GetInfo, GetSedesConocidas, Heartbeat, MsgSedeASede, SedeInfo};
+use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
 use std::io;
 use std::io::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tokio::net::TcpStream;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
@@ -37,11 +37,14 @@ pub struct Sede {
     sede_id: u32,
     coords: (f64, f64),
     slots: Vec<Addr<Slot>>,
+    alquileres_activos: Vec<AlquilerActivo>,
+    devoluciones_recibidas: Vec<DevolucionRecibida>,
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
     sedes_conocidas: Vec<SedeInfo>,
     sede_info: SedeInfo,
     procesador_pagos_addrs: Vec<String>,
+    // online: bool,
     lider_cacheado: Arc<Mutex<Option<String>>>,
 }
 
@@ -152,6 +155,14 @@ impl Sede {
         Ok(BiciAlquilada::new(bici_id, alquiler_id, cliente_id.to_string(), sede_id, inicio_ts, token_alquiler))
     }
 
+    fn poner_online(&self) -> bool {
+        todo!()
+    }
+
+    fn poner_offline(&self) -> bool {
+        todo!()
+    }
+
     async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
 
         let mut bici_ganadora: Option<(usize, String)> = None;
@@ -194,6 +205,8 @@ impl Sede {
                         println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                         let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
                         let _ = sede_addr.send(ActualizarDisponibilidadSolicitar).await;
+                        let alquiler = crear_alquilerActivo(&bici);
+                        let _ = sede_addr.send(GuardarAlquiler {alquiler}).await;
                         dinero -= PREMONTO;
 
                         RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)
@@ -219,6 +232,49 @@ impl Sede {
     }
 }
 
+fn crear_alquilerActivo(bici: &BiciAlquilada) -> AlquilerActivo {
+    AlquilerActivo {
+        alquiler_id: bici.alquiler_id().to_string(),
+        bici_id: bici.bici_id().to_string(),
+        cliente_id: bici.cliente_id().to_string(),
+        sede_origen_id: bici.sede_origen_id(),
+        inicio_ts: bici.inicio_ts(),
+        pago_preautorizacion_id: "falta".to_string(), // ?
+        deadline_devolucion_ts: bici.inicio_ts(),
+        estado: EstadoAlquiler::Activo,
+        pago_multa_id: Some("".to_string()),
+        reembolso_multa_id: Some("".to_string()),
+    }
+}
+
+fn crear_devolucion(bici: BiciAlquilada, sede_destino_id: u32, fin_ts: u64, monto: f64) -> DevolucionRecibida {
+    DevolucionRecibida {
+        alquiler_id: bici.alquiler_id().to_string(),
+        bici_id: bici.bici_id().to_string(),
+        cliente_id: bici.cliente_id().to_string(),
+        sede_origen_id: bici.sede_origen_id(),
+        sede_destino_id,
+        fin_ts,
+        monto,
+        pago_id: Some("".to_string()),
+        estado_pago: EstadoConciliacion::Confirmado,
+        estado_notificacion_origen: EstadoConciliacion::Confirmado,
+    }
+}
+
+fn crear_notificacion_devolucion(d: DevolucionRecibida, token: String) -> NotificarDevolucion {
+    NotificarDevolucion {
+        alquiler_id: d.alquiler_id,
+        bici_id: d.bici_id,
+        cliente_id: d.cliente_id,
+        sede_origen_id: d.sede_origen_id,
+        sede_destino_id: d.sede_destino_id,
+        fin_ts: d.fin_ts,
+        monto: d.monto,
+        pago_id: d.pago_id,
+        token_alquiler: token,
+    }
+}
 impl Actor for Sede {
     type Context = Context<Self>;
 
@@ -243,12 +299,33 @@ impl Sede {
             }
         }
     }
+
+    fn alquiler_ya_procesado(&self, alquiler_id: &str) -> bool {
+        self.alquileres_activos
+            .iter()
+            .find(|a| a.alquiler_id == alquiler_id)
+            .map(|a| {
+                matches!(
+                a.estado,
+                EstadoAlquiler::Cerrado
+                    | EstadoAlquiler::RoboConfirmado
+                    | EstadoAlquiler::RoboRevertido
+            )
+            })
+            .unwrap_or(false)
+    }
+
+    fn cerrar_alquiler(&mut self, alquiler: NotificarDevolucion) {
+        self.alquileres_activos
+            .retain(|a| a.alquiler_id != alquiler.alquiler_id);
+    }
 }
 
 impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
     type Result = ();
 
     fn handle(&mut self, _msg: ActualizarDisponibilidadSolicitar, _ctx: &mut Self::Context) -> Self::Result {
+
         self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_sub(1);
         self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_add(1);
         self.sede_info.ultimo_update_ts = timestamp_actual();
@@ -280,6 +357,42 @@ impl Handler<GetSedesConocidas> for Sede {
     }
 }
 
+impl Handler<GuardarAlquiler> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: GuardarAlquiler, _ctx: &mut Self::Context) -> Self::Result {
+        self.alquileres_activos.push(msg.alquiler);
+    }
+}
+
+impl Handler<GuardarDevolucion> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: GuardarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
+        self.devoluciones_recibidas.push(msg.devolucion);
+    }
+}
+
+impl Handler<NotificarDevolucion> for Sede {
+    type Result = MessageResult<NotificarDevolucion>;
+
+    fn handle(&mut self, msg: NotificarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
+
+        println!("[sede] Recibí notificación de devolución");
+
+        let alquiler_id = msg.alquiler_id.clone();
+
+        if self.alquiler_ya_procesado(&alquiler_id) { //idempotencia
+            return MessageResult(AckDevolucion {alquiler_id: msg.alquiler_id});
+        }
+
+        self.cerrar_alquiler(msg);
+
+        MessageResult(AckDevolucion {alquiler_id: alquiler_id})
+    }
+}
+
+
 impl Handler<PedirSedes> for Sede {
     type Result = MessageResult<PedirSedes>;
 
@@ -304,6 +417,9 @@ impl Handler<SolicitarBici> for Sede {
             println!("[sede] Envia AlquilerRechazado: {}", motivo);
             return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(motivo) });
         }
+
+        println!("[AAA] {:?}", self.alquileres_activos);
+        println!("[AAA] {:?}", self.devoluciones_recibidas);
 
         let slots = self.slots.clone();
         let sede_id = self.sede_id;
@@ -407,6 +523,27 @@ impl Handler<AckComprobanteAlquiler> for Sede {
     }
 }
 
+struct ConfirmarNotificacionOrigen {
+    alquiler_id: String
+}
+
+impl Message for ConfirmarNotificacionOrigen {
+    type Result = ();
+}
+impl Handler<ConfirmarNotificacionOrigen> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: ConfirmarNotificacionOrigen, _ctx: &mut Self::Context) {
+        if let Some(dev) = self.devoluciones_recibidas
+            .iter_mut()
+            .find(|d| d.alquiler_id == msg.alquiler_id)
+        {
+            dev.estado_notificacion_origen =
+                EstadoConciliacion::Confirmado;
+        }
+    }
+}
+
 impl Handler<DevolverBici> for Sede {
     type Result = ResponseFuture<RespuestaDevolverBici>;
 
@@ -435,6 +572,7 @@ impl Handler<DevolverBici> for Sede {
         let lider_cacheado = self.lider_cacheado.clone();
         let alquiler_id = msg.bici.alquiler_id().to_string();
         let cliente_id = msg.bici.cliente_id().to_string();
+        let sede_id = self.sede_id.clone();
 
         Box::pin(async move {
             let cobro = Self::generar_msg_de_cobro(monto, alquiler_id, cliente_id);
@@ -462,6 +600,27 @@ impl Handler<DevolverBici> for Sede {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
                     Ok(true) => {
                         let _ = sede_addr.send(ActualizarDisponibilidadDevolver).await;
+                        let bici = msg.bici.clone();
+                        let devolucion = crear_devolucion(msg.bici, sede_id, timestamp_actual(), monto as f64);
+                        let notificacion_devolucion = crear_notificacion_devolucion(devolucion.clone(), bici.token_alquiler().parse().unwrap());
+                        let _ = sede_addr.send(GuardarDevolucion {devolucion}).await;
+
+                        let sede_origen = notificacion_devolucion.sede_origen_id;
+
+                        match enviar_notificacion(sede_origen, notificacion_devolucion).await { //do_send cuando me llega el Ack handleo el mensaje Ack
+                            Ok(ack) => {
+                                let _ = sede_addr.send(
+                                    ConfirmarNotificacionOrigen {
+                                        alquiler_id: ack.alquiler_id,
+                                    }
+                                ).await;
+                            }
+                            Err(_) => {
+                                // sigue Pendiente
+                            }
+                        }
+
+
                         return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto);
                     }
                     _ => continue,
@@ -472,6 +631,8 @@ impl Handler<DevolverBici> for Sede {
         })
     }
 }
+
+
 
 fn preparar_monto(dinero: u32, tiempo_inicio: u64) -> Result<u32, RespuestaDevolverBici> {
     let fin = timestamp_actual();
@@ -541,7 +702,7 @@ mod tests {
     use super::*;
     use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-    use matenmutex::messages::sedes::crear_info_dummy;
+    use matenmutex::messages::sede_sede::crear_info_dummy;
     use matenmutex::slot::{crear_slots_con_estados, EstadoSlot};
 
     fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
@@ -618,6 +779,8 @@ mod tests {
             sede_id: 1,
             coords: (-34.6037, -58.3816),
             slots,
+            alquileres_activos: vec![],
+            devoluciones_recibidas: vec![],
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
             sedes_conocidas: vec![],
@@ -1287,8 +1450,8 @@ async fn main() {
                 Ok(r) => r,
                 Err(e) => { eprintln!("UDP recv error: {}", e); continue; }
             };
-            match serde_json::from_slice::<MsgSedeASede>(&buf[..len]) {
-                Ok(MsgSedeASede::Heartbeat(msg)) => {
+            match serde_json::from_slice::<MsgSedeHeartbeat>(&buf[..len]) {
+                Ok(MsgSedeHeartbeat::Heartbeat(msg)) => {
                     sede_rx.send(msg).await.ok();
                 }
                 Err(e) => eprintln!("UDP parse error from {}: {}", peer, e),
@@ -1300,10 +1463,19 @@ async fn main() {
     let udp_tx = udp.clone();
     let sede_tx = sede.clone();
     let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
+
+    // let pair = Arc::new((Mutex::new(true), Condvar::new()));
+
     tokio::spawn(async move {
         let mut bootstrapped = false; //para no pegarle a todos lados
 
+
         loop {
+            //
+            // if estoy_offline {
+            //     continue;
+            // }
+
             let info = sede_tx.send(GetInfo).await.unwrap();
             let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
 
@@ -1315,10 +1487,8 @@ async fn main() {
             };
 
             let heartbeat = serde_json::to_vec(
-                &MsgSedeASede::Heartbeat(Heartbeat { sede_id, info })
+                &MsgSedeHeartbeat::Heartbeat(Heartbeat { sede_id, info })
             ).unwrap();
-
-
 
             for addr in &targets {
                 udp_tx.send_to(&heartbeat, addr.as_str()).await.ok();
@@ -1328,7 +1498,76 @@ async fn main() {
         }
     });
 
+    let sede_sede_addr = format!("127.0.0.1:888{}", n);
+    let sede_sede_listener = TcpListener::bind(&sede_sede_addr).await.unwrap();
+    tokio::spawn(loop_sedes(sede.clone(), sede_sede_listener));
+
+    // tokio::spawn(loop_cli(sede));
+
     loop_pub(sede, public_listener).await;
+}
+
+// async fn loop_cli(sede) {
+//     let stdin = tokio::io::stdin();
+//     let mut lines = BufReader::new(stdin).lines();
+//
+//     while let Ok(Some(line)) = lines.next_line().await {
+//         let input = line.trim().to_string();
+//         let parts: Vec<&str> = input.split_whitespace().collect();
+//
+//         let result = match parts.as_slice() {
+//             ["online"] => sede.poner_online(),
+//             ["offline"] => sede.poner_offline().await,
+//             _ => {
+//                 println!("Comando Invalido: '{}'", input);
+//                 continue;
+//             }
+//         };
+//
+//         if let Err(e) = result {
+//             println!("Error: {}", e);
+//         }
+//     }
+// }
+async fn loop_sedes(sede: Addr<Sede>,  listener: TcpListener) {
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let sede = sede.clone();
+
+        tokio::spawn(async move {
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = BufReader::new(reader).lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+
+                let response = match serde_json::from_str::<MsgSedeASede>(&line) {
+
+                    Ok(MsgSedeASede::NotificarDevolucion(msg)) => {
+
+                        match sede.send(msg).await {
+
+                            Ok(ack) => {
+                                serde_json::to_string(&ack)
+                                    .unwrap() + "\n"
+                            }
+
+                            Err(_) => {
+                                "ERROR\n".to_string()
+                            }
+                        }
+                    }
+
+                    Err(_) => {
+                        "UNKNOWN\n".to_string()
+                    },
+                    Ok(MsgSedeASede::AckDevolucion(_)) => todo!()
+                };
+
+                writer.write_all(response.as_bytes()).await.ok();
+            }
+        });
+    }
 }
 
 fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
@@ -1349,6 +1588,8 @@ fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coor
         sede_id,
         coords,
         slots,
+        alquileres_activos: vec![],
+        devoluciones_recibidas: vec![],
         token_secret,
         pending_reservas: std::collections::HashMap::new(),
         procesador_pagos_addrs,
@@ -1442,3 +1683,41 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
     }
 }
 
+pub async fn enviar_notificacion( sede_origen_id: u32, info: NotificarDevolucion) -> Result<AckDevolucion, String> {
+    
+    let addr = format!("127.0.0.1:888{}", sede_origen_id);
+
+    println!("[sede] Intentando notificar devolucion a sede {}", sede_origen_id);
+
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| format!("No pude conectar: {}", e))?;
+
+    let msg = serde_json::to_string(
+        &MsgSedeASede::NotificarDevolucion(info)
+    )
+        .map_err(|e| e.to_string())?;
+
+    stream
+        .write_all(format!("{msg}\n").as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+
+    reader
+        .read_line(&mut response)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    serde_json::from_str::<AckDevolucion>(response.trim())
+        .map_err(|e| e.to_string())
+}
+
+// cliente offline -> solamente peudo conectar_sede cuando estoy en rango
+// pedir_sedes -> tambien solo en rango
+
+// sede -> no heartbeat
+// sede -> no actualizar alquileres
+//
