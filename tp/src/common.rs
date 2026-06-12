@@ -18,3 +18,4 @@ pub fn calcular_distancia(coords_a: (f64, f64), coords_b: (f64, f64)) -> f64 {
 
     ((coords_sede_x - coords_cliente_x).powi(2) + (coords_sede_y - coords_cliente_y).powi(2)).sqrt()
 }
+

@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use matenmutex::common::calcular_distancia;
-use matenmutex::messages::sedes::SedeInfo;
+use matenmutex::messages::sede_sede::SedeInfo;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";

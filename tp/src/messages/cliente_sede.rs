@@ -1,7 +1,7 @@
 use actix::Message;
 use serde::{Deserialize, Serialize};
 use crate::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use crate::messages::sedes::SedeInfo;
+use crate::messages::sede_sede::SedeInfo;
 use crate::types::BiciAlquilada;
 
 #[derive(Serialize, Deserialize)]
