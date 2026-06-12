@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum MsgProcesador {
-    Heartbeat { procesador_id: u32 },
+    Heartbeat { procesador_id: u32, es_lider: bool },
     HeartbeatAck { procesador_id: u32 },
     Eleccion { procesador_id: u32 },
     Ok { procesador_id: u32 },
@@ -15,7 +15,7 @@ mod tests {
     #[test]
     fn test_serializaion_y_deserializacion_de_cada_variante() {
         let mensajes = [
-            MsgProcesador::Heartbeat { procesador_id: 2 },
+            MsgProcesador::Heartbeat { procesador_id: 2, es_lider: false },
             MsgProcesador::HeartbeatAck { procesador_id: 3 },
             MsgProcesador::Eleccion { procesador_id: 4 },
             MsgProcesador::Ok { procesador_id: 5 },
