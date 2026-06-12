@@ -9,7 +9,7 @@ use matenmutex::messages::procesador_procesador_pagos::MsgProcesadorAProcesador;
 use matenmutex::messages::procesadores::MsgProcesador;
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::types::{EstadoPago, EstadoTransaccionPago, PagoProcesado, TipoOperacionPago, TransaccionPago2PC, Voto2PC};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::interval;
@@ -65,6 +65,32 @@ struct ProcesadorPagosConfig {
     rol: RolConfig,
     #[serde(default)] // Usamos esto para que si las configs no vienen con el campo no rompa, usamos el campo para forzar el rechazo.
     rechazar_si_monto_supera: Option<f64>,
+}
+
+/// Snapshot del estado durable de un nodo, para recuperarse tras un crash.
+#[derive(Serialize, Deserialize, Default)]
+struct EstadoPersistente {
+    pagos_procesados: Vec<PagoProcesado>,
+    transacciones_en_curso: Vec<TransaccionPago2PC>,
+    preparados_replica: HashMap<String, MsgSedeAProcesadorPagos>,
+}
+
+/// Path del archivo de estado de un nodo, derivado de su id.
+fn estado_path_de_id(procesador_id: u32) -> String {
+    format!("estado_procesador_{}.json", procesador_id)
+}
+
+/// Lee el snapshot de disco. Si el archivo no existe, arranca con estado vacio (primer boot).
+/// Cualquier otra falla (no se puede abrir, o existe pero esta corrupto) corta el arranque:
+/// arrancar vacio pisaria el estado durable en el primer persistir().
+fn cargar_estado(path: &str) -> Result<EstadoPersistente, Box<dyn std::error::Error>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(EstadoPersistente::default()),
+        Err(e) => return Err(format!("no se pudo abrir el estado en {path}: {e}").into()),
+    };
+    serde_json::from_reader(BufReader::new(file))
+        .map_err(|e| format!("estado corrupto en {path}: {e}").into())
 }
 
 /// Rol del nodo en runtime. Muta según lo resuelve bully.
@@ -156,6 +182,7 @@ struct ProcesadorPagos {
     transacciones_en_curso: Mutex<Vec<TransaccionPago2PC>>,
     preparados_replica: Mutex<HashMap<String, MsgSedeAProcesadorPagos>>,
     rechazar_si_monto_supera: Option<f64>,
+    estado_path: String,
 }
 
 impl ProcesadorPagos {
@@ -174,6 +201,9 @@ impl ProcesadorPagos {
             }
         };
 
+        let estado_path = estado_path_de_id(config.procesador_id);
+        let estado = cargar_estado(&estado_path)?;
+
         Ok(Self {
             procesador_id: config.procesador_id,
             ip: config.private_addr.ip(),
@@ -185,11 +215,36 @@ impl ProcesadorPagos {
             rol_actual: Mutex::new(rol_actual),
             recibio_ok: Mutex::new(false),
             tiempos: TiemposBuilder::new().build()?,
-            pagos_procesados: Mutex::new(Vec::new()),
-            transacciones_en_curso: Mutex::new(Vec::new()),
-            preparados_replica: Mutex::new(HashMap::new()),
+            pagos_procesados: Mutex::new(estado.pagos_procesados),
+            transacciones_en_curso: Mutex::new(estado.transacciones_en_curso),
+            preparados_replica: Mutex::new(estado.preparados_replica),
             rechazar_si_monto_supera: config.rechazar_si_monto_supera,
+            estado_path,
         })
+    }
+
+    /// Vuelca el estado durable a disco de forma atomica (escribe a un .tmp y renombra).
+    /// Los errores se loguean: una falla de persistencia no debe tumbar al nodo.
+    fn persistir(&self) {
+        if self.estado_path.is_empty() {
+            return;
+        }
+        let snapshot = EstadoPersistente {
+            pagos_procesados: self.pagos_procesados.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            transacciones_en_curso: self.transacciones_en_curso.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            preparados_replica: self.preparados_replica.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+        let json = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("[persistencia] no se pudo serializar el estado: {e}");
+                return;
+            }
+        };
+        let tmp = format!("{}.tmp", self.estado_path);
+        if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &self.estado_path)) {
+            eprintln!("[persistencia] no se pudo escribir {}: {e}", self.estado_path);
+        }
     }
 
     async fn init(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
@@ -289,6 +344,8 @@ impl ProcesadorPagos {
 
         let (pago, respuesta) = self.decidir_operacion(msg);
         pagos.push(pago);
+        drop(pagos);
+        self.persistir();
         respuesta
     }
 
@@ -308,6 +365,7 @@ impl ProcesadorPagos {
             if let Ok(mut pagos) = self.pagos_procesados.lock() {
                 pagos.push(pago);
             }
+            self.persistir();
             return respuesta;
         }
 
@@ -359,6 +417,7 @@ impl ProcesadorPagos {
             transacciones.retain(|t| t.payment_request_id != payment_request_id);
         }
 
+        self.persistir();
         respuesta
     }
 
@@ -502,6 +561,7 @@ impl ProcesadorPagos {
                 if let Ok(mut preparados) = self.preparados_replica.lock() {
                     preparados.insert(payment_request_id.clone(), pago);
                 }
+                self.persistir();
                 Some(MsgProcesadorAProcesador::VotoPago {
                     payment_request_id,
                     votante_id: self.procesador_id,
@@ -510,6 +570,7 @@ impl ProcesadorPagos {
             }
             MsgProcesadorAProcesador::CommitPago { payment_request_id } => {
                 self.persistir_commit_replica(&payment_request_id);
+                self.persistir();
                 Some(MsgProcesadorAProcesador::AckDecisionPago {
                     payment_request_id,
                     votante_id: self.procesador_id,
@@ -519,6 +580,7 @@ impl ProcesadorPagos {
                 if let Ok(mut preparados) = self.preparados_replica.lock() {
                     preparados.remove(&payment_request_id);
                 }
+                self.persistir();
                 Some(MsgProcesadorAProcesador::AckDecisionPago {
                     payment_request_id,
                     votante_id: self.procesador_id,
@@ -677,6 +739,29 @@ impl ProcesadorPagos {
         }
     }
 
+    /// Red de seguridad contra split-brain: si un heartbeat anuncia un lider de id
+    /// mayor al que reconozco, me subordino como replica. Cubre el caso del ex-lider
+    /// que revive con el rol del config y se cree lider cuando ya hay otro.
+    fn reconciliar_con_lider_por_heartbeat(&self, lider_emisor: u32) {
+        let mut rol = match self.rol_actual.lock() {
+            Ok(rol) => rol,
+            Err(e) => {
+                println!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
+                return;
+            }
+        };
+        let debe_ser_replica = match *rol {
+            RolActual::Lider => lider_emisor > self.procesador_id,
+            RolActual::Replica { lider_id } => lider_emisor > lider_id,
+            RolActual::Candidato => false,
+        };
+        if debe_ser_replica {
+            *rol = RolActual::Replica { lider_id: lider_emisor };
+            drop(rol); //
+            println!("[NODO {}]: heartbeat de lider {} con id mayor: me subordino como REPLICA", self.procesador_id, lider_emisor);
+        }
+    }
+
     fn intentar_pasar_a_candidato(&self) -> bool {
         match self.rol_actual.lock() {
             Ok(mut rol) => {
@@ -723,7 +808,8 @@ impl ProcesadorPagos {
         let mut ticker = interval(self.tiempos.heartbeat);
         loop {
             ticker.tick().await;
-            let msg = MsgProcesador::Heartbeat { procesador_id: self.procesador_id };
+            let es_lider = matches!(self.rol(), Some(RolActual::Lider));
+            let msg = MsgProcesador::Heartbeat { procesador_id: self.procesador_id, es_lider };
             self.enviar_a(&self.objetivos_heartbeat(), &msg).await;
         }
     }
@@ -842,7 +928,10 @@ impl ProcesadorPagos {
         nodo.actualizar_liveness(&etiqueta, from);
 
         match msg {
-            MsgProcesador::Heartbeat { .. } => {
+            MsgProcesador::Heartbeat { procesador_id: emisor_id, es_lider } => {
+                if es_lider {
+                    nodo.reconciliar_con_lider_por_heartbeat(emisor_id);
+                }
                 nodo.enviar_heartbeat_ack(from).await;
             }
             MsgProcesador::HeartbeatAck { procesador_id: emisor_id } => {
@@ -954,6 +1043,7 @@ impl ProcesadorPagos {
                     preparados.remove(&payment_request_id);
                 }
             }
+            self.persistir();
         }
     }
 
@@ -1260,6 +1350,7 @@ mod tests {
             transacciones_en_curso: Mutex::new(Vec::new()),
             preparados_replica: Mutex::new(HashMap::new()),
             rechazar_si_monto_supera: None,
+            estado_path: String::new(),
         })
     }
 
@@ -1935,6 +2026,7 @@ mod tests {
             transacciones_en_curso: Mutex::new(Vec::new()),
             preparados_replica: Mutex::new(HashMap::new()),
             rechazar_si_monto_supera: limite,
+            estado_path: String::new(),
         });
         tokio::spawn(nodo.clone().accept_loop_2pc());
         nodo
