@@ -1,13 +1,13 @@
 use actix::{Actor, Context};
-use matenmutex::messages::cliente_sede::{
-    AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PreguntarBicis, SolicitarBici,
-};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use matenmutex::common::calcular_distancia;
+use matenmutex::messages::sedes::SedeInfo;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -21,6 +21,7 @@ pub struct Cliente {
     reader: Option<Lines<BufReader<OwnedReadHalf>>>,
     bici_activa: Option<BiciAlquilada>,
     dinero: u32,
+    sedes_conocidas: Vec<SedeInfo>,
 }
 
 impl Actor for Cliente {
@@ -36,12 +37,13 @@ impl Cliente {
             reader: None,
             bici_activa: None,
             dinero,
+            sedes_conocidas: vec![],
         }
     }
 
     fn mostrar_bici(&mut self) {
-        if self.bici_activa.is_some() {
-            println!("[cliente] Mi bici es: {}", self.bici_activa.as_ref().unwrap().bici_id);
+        if let Some(bici) = &self.bici_activa {
+            println!("[cliente] Mi bici es: {}", bici.bici_id);
         } else {
             println!("[cliente] No tengo bici");
         }
@@ -51,9 +53,20 @@ impl Cliente {
         println!("[cliente] Mi dinero es: {}", self.dinero);
     }
 
-    fn recargar_dinero(&mut self, monto: u32) {
-        self.dinero += monto;
+    fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
+        let monto: u32 = monto.parse()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput,format!("'{}' no es un numero valido", monto),)
+            })?;
+
+        self.dinero = self.dinero.checked_add(monto)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput,"La recarga excede el saldo máximo permitido",)
+            })?;
+
         println!("[cliente] Recarga de ${}. Dinero actual: ${}", monto, self.dinero);
+
+        Ok(())
     }
 
     async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
@@ -66,7 +79,42 @@ impl Cliente {
         Ok(())
     }
 
+    fn print_sedes(sedes: &[SedeInfo], coords: (f64, f64)) {
+        for sede in sedes {
+            let dist = calcular_distancia(sede.coords, coords);
+            println!(
+                "Sede {} | distancia: {}m | slots disponibles: {} | slots vacios {}", sede.sede_id, dist, sede.slots_disponibles, sede.slots_vacios
+            )
+        }
+    }
+    async fn pedir_sedes(&mut self) -> Result<(), io::Error> {
+        let coords = self.coords;
+        let (writer, reader) = self.validar_conexion()?;
+        let respuesta = Self::enviar_info_sedes_cercanas(coords, writer, reader).await?;
+
+        if let Some(json) = respuesta {
+            match serde_json::from_str::<Vec<SedeInfo>>(&json) {
+                Ok(sedes) => {
+                    self.sedes_conocidas = sedes;
+                }
+                Err(e) => {
+                    eprintln!("[error] fallo al deserializar sedes: {} | json: {}", e, json);
+                }
+            }
+        } else {
+            eprintln!("[warn] respuesta vacia, no se recibieron sedes");
+        }
+
+        Cliente::print_sedes(&self.sedes_conocidas, coords);
+        Ok(())
+    }
+
     async fn solicitar_bici(&mut self) -> Result<(), io::Error> {
+        if self.bici_activa.is_some() {
+            println!("[cliente] Ya tenes una bici");
+            return Ok(());
+        }
+
         let cliente_id = self.cliente_id;
         let coords = self.coords;
         let dinero = self.dinero;
@@ -84,6 +132,13 @@ impl Cliente {
     async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), dinero: u32, writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
         let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords, dinero});
         println!("[cliente] Envia SolicitarBici");
+        let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
+        Ok(respuesta)
+    }
+
+    async fn enviar_info_sedes_cercanas(coords: (f64, f64), writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
+        let msg = MsgClienteASede::PedirSedes(PedirSedes {coords});
+        println!("[cliente] Envia Pedir Sedes");
         let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
         Ok(respuesta)
     }
@@ -133,7 +188,9 @@ impl Cliente {
             return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
 
-        let bici = self.bici_activa.clone().unwrap();
+        let bici = self.bici_activa.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver")
+        })?;
         let coords = self.coords;
         let dinero = self.dinero;
         let (writer, reader) = self.validar_conexion()?;
@@ -188,6 +245,7 @@ impl Cliente {
     }
 }
 
+
 async fn enviar_mensaje_a_sede(
     writer: &mut OwnedWriteHalf,
     reader: &mut Lines<BufReader<OwnedReadHalf>>,
@@ -216,6 +274,7 @@ async fn main() {
          {GREEN}  devolver_bici{RESET}      - Devolver la bici\n\
          {GREEN}  info_bicis{RESET}         - Ver bicis disponibles\n\
          {GREEN}  recarga <n>{RESET}        - Recargar dinero\n\
+         {GREEN}  pedir_sedes{RESET}        - Pide Sede CErcanas\n\
          {GREEN}  quit{RESET}               - Salir\n"
         );
 
@@ -233,7 +292,8 @@ async fn main() {
             ["info_bicis"] => cliente.info_bicis().await,
             ["bici"] => Ok(cliente.mostrar_bici()),
             ["dinero"] => Ok(cliente.mostrar_dinero()),
-            ["recarga", n] => Ok(cliente.recargar_dinero(n.parse().unwrap())),
+            ["recarga", n] => cliente.recargar_dinero(n),
+            ["pedir_sedes"] => cliente.pedir_sedes().await,
             ["quit"] => break,
             _ => {
                 println!("Comando Invalido: '{}'", input);
