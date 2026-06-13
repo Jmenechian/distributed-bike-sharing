@@ -15,7 +15,6 @@ pub enum MsgSedeHeartbeat {
 #[derive(Serialize, Deserialize)]
 pub enum MsgSedeASede {
     NotificarDevolucion(NotificarDevolucion),
-    AckDevolucion(AckDevolucion), //esto hay que sacarlo, no hay msg de Ack
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -84,7 +83,7 @@ impl Message for GetSedesConocidas {
 // Alquileres
 // ##############################
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AlquilerActivo {
     pub alquiler_id: String, //
     pub bici_id: String, //
@@ -99,7 +98,7 @@ pub struct AlquilerActivo {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EstadoAlquiler {
     Activo,
     Sospechoso,
@@ -207,4 +206,16 @@ pub struct VerificarRoboMasTarde {
 
 impl Message for VerificarRoboMasTarde {
     type Result = ();
+}
+
+pub struct GetAlquileresActivos;
+
+impl Message for GetAlquileresActivos {
+    type Result = Vec<AlquilerActivo>;
+}
+
+pub struct GetDevolucionesRecibidas;
+
+impl Message for GetDevolucionesRecibidas {
+    type Result = Vec<DevolucionRecibida>;
 }

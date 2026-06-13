@@ -1,6 +1,6 @@
 pub const DISTANCIA_MINIMA: f64 = 2.0;
-pub const PREMONTO: u32 = 150;
-pub const TASA: u32 = 20;
+pub const PREMONTO: f64 = 150.0;
+pub const TASA: f64 = 20.0;
 
 // const CONFIG_FILE: usize = 1;
 // const MINIMAL_LENGTH: usize = 2;
@@ -10,7 +10,7 @@ pub const LIVENESS_TIMEOUT: u64 = 15;
 // const TIMEOUT_OK: u64 = 3;
 // const TIMEOUT_COORDINADOR: u64 = 8;
 pub const PUERTO_BASE: u16 = 6000;
-pub const MAX_VALUE: u32 = 4294967295;
+pub const MAX_VALUE: f64 = 999999.0;
 
 pub fn calcular_distancia(coords_a: (f64, f64), coords_b: (f64, f64)) -> f64 {
     let (coords_sede_x, coords_sede_y) = coords_a;

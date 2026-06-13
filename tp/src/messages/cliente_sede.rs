@@ -8,7 +8,7 @@ use crate::types::BiciAlquilada;
 pub struct SolicitarBici {
     pub cliente_id: u32,
     pub coords: (f64, f64),
-    pub dinero: u32,
+    pub dinero: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct AckComprobanteAlquiler {
 pub struct DevolverBici {
     pub bici: BiciAlquilada,
     pub coords: (f64, f64),
-    pub dinero: u32,
+    pub dinero: f64,
 }
 
 #[derive(Serialize, Deserialize)]
