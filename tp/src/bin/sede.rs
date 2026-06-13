@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::sleep;
+use tokio::sync::Notify;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
@@ -20,7 +21,7 @@ use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAPro
 use matenmutex::slot::Cancelar;
 use std::io;
 use std::io::Error;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
@@ -1468,12 +1469,24 @@ async fn main() {
 
     println!("Sede {} — publica: {}, interna: {}", n, public_addr, private_addr);
 
+    // Estado online/offline: lo mutua la CLI, lo leen el loop publico y el sender de heartbeats.
+    // El loop publico se duerme en despertar.notified() cuando esta offline.
+    let offline = Arc::new(Mutex::new(false));
+    let despertar = Arc::new(Notify::new());
+
     // receiver
     let udp_rx = udp.clone();
     let sede_rx = sede.clone();
+    let offline_recv = offline.clone();
+    let despertar_recv = despertar.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 1024];
         loop {
+            // Offline: aislada, tampoco escucha heartbeats de otras sedes. Duerme hasta volver online.
+            if *offline_recv.lock().unwrap_or_else(|e| e.into_inner()) {
+                despertar_recv.notified().await;
+            }
+
             let (len, peer) = match udp_rx.recv_from(&mut buf).await {
                 Ok(r) => r,
                 Err(e) => { eprintln!("UDP recv error: {}", e); continue; }
@@ -1490,17 +1503,19 @@ async fn main() {
     // sender
     let udp_tx = udp.clone();
     let sede_tx = sede.clone();
+    let offline_hb = offline.clone();
     let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
-
-    // let pair = Arc::new((Mutex::new(true), Condvar::new()));
 
     tokio::spawn(async move {
         let mut bootstrapped = false; //para no pegarle a todos lados
 
 
         loop {
-
-
+            // Offline: no anunciamos heartbeats. El propio sleep nos despierta a revisar de nuevo.
+            if *offline_hb.lock().unwrap_or_else(|e| e.into_inner()) {
+                sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
+                continue;
+            }
 
             let info = sede_tx.send(GetInfo).await.unwrap();
             let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
@@ -1526,15 +1541,47 @@ async fn main() {
 
     let sede_sede_addr = format!("127.0.0.1:888{}", n);
     let sede_sede_listener = TcpListener::bind(&sede_sede_addr).await.unwrap();
-    tokio::spawn(loop_sedes(sede.clone(), sede_sede_listener));
+    tokio::spawn(loop_cli(offline.clone(), despertar.clone()));
 
-    // tokio::spawn(loop_cli(sede));
+    tokio::spawn(loop_sedes(sede.clone(), sede_sede_listener, offline, despertar));
 
     loop_pub(sede, public_listener).await;
 }
 
-async fn loop_sedes(sede: Addr<Sede>,  listener: TcpListener) {
+/// CLI de la sede: muta el estado online/offline. Al volver online despierta al loop publico.
+async fn loop_cli(offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
+    println!("Comandos de la sede: online | offline");
+
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        match line.trim() {
+            "offline" => {
+                *offline.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                println!("[sede] offline");
+            }
+            "online" => {
+                *offline.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                despertar.notify_waiters(); // despierta a loop_sedes y al receiver, ambos esperando
+                println!("[sede] online");
+            }
+            "" => {}
+            otro => println!("Comando invalido: '{}' (online | offline)", otro),
+        }
+    }
+}
+
+async fn loop_sedes(sede: Addr<Sede>, listener: TcpListener, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
     loop {
+        // Offline: Nos dormimos hasta que la CLI vuelva online
+        // y dispare notify_waiters. loop_pub sigue aparte, asi que se atienden clientes locales.
+        if *offline.lock().unwrap_or_else(|e| e.into_inner()) {
+            println!("[sede] offline — aislada de otras sedes, esperando online");
+            despertar.notified().await;
+            println!("[sede] online — reanudando comunicacion entre sedes");
+        }
+
         let (socket, _) = listener.accept().await.unwrap();
 
         let sede = sede.clone();
@@ -1715,15 +1762,3 @@ pub async fn enviar_notificacion( addr: String, info: NotificarDevolucion) -> Re
     serde_json::from_str::<AckDevolucion>(response.trim())
         .map_err(|e| e.to_string())
 }
-
-
-// offline
-// ####
-// cliente offline -> solamente peudo conectar_sede cuando estoy en rango
-// pedir_sedes -> tambien solo en rango
-
-// sede -> no heartbeat
-// sede -> no actualizar alquileres
-// ####
-
-// ctx.run_later para bici robada -> bueno
