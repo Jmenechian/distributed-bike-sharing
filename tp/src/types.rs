@@ -1,9 +1,7 @@
 use crate::messages::sede_procesador::MsgSedeAProcesadorPagos;
-use crate::messages::sedes::MsgSedeASede;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-
+use crate::messages::sede_sede::{MsgSedeASede, MsgSedeHeartbeat};
 
 pub fn timestamp_actual() -> u64 {
     SystemTime::now()
@@ -20,7 +18,7 @@ pub struct Bici {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BiciAlquilada {
     pub bici_id: String,
-    alquiler_id: String,
+    pub alquiler_id: String,
     cliente_id: String,
     sede_origen_id: u32,
     inicio_ts: u64,
@@ -161,7 +159,7 @@ pub struct PagoPendiente {
 pub struct NotificacionPendiente {
     pub id: String,
     pub destino_sede_id: u32,
-    pub mensaje: MsgSedeASede,
+    pub mensaje: MsgSedeHeartbeat,
 }
 
 #[cfg(test)]
@@ -310,7 +308,7 @@ mod tests_pagos {
 #[cfg(test)]
 mod tests_persistencia_sede {
     use super::*;
-    use crate::messages::sedes::{crear_info_dummy, Heartbeat, MsgSedeASede};
+    use crate::messages::sede_sede::{crear_info_dummy, Heartbeat, MsgSedeASede, MsgSedeHeartbeat};
 
     #[test]
     fn alquiler_activo_round_trip() {
@@ -361,7 +359,7 @@ mod tests_persistencia_sede {
         let notif = NotificacionPendiente {
             id: "n-1".to_string(),
             destino_sede_id: 2,
-            mensaje: MsgSedeASede::Heartbeat(Heartbeat { sede_id: 1, info: crear_info_dummy() }),
+            mensaje: MsgSedeHeartbeat::Heartbeat(Heartbeat { sede_id: 1, info: crear_info_dummy() }),
         };
         let json = serde_json::to_string(&notif).unwrap();
         let de: NotificacionPendiente = serde_json::from_str(&json).unwrap();

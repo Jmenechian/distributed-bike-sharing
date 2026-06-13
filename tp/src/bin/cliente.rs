@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use matenmutex::common::calcular_distancia;
-use matenmutex::messages::sedes::SedeInfo;
+use matenmutex::messages::sede_sede::SedeInfo;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -24,7 +24,7 @@ struct ClienteConfig {
     cliente_id: u32,
     coord_x: f64,
     coord_y: f64,
-    dinero: u32,
+    dinero: f64,
 }
 
 pub struct Cliente {
@@ -33,7 +33,7 @@ pub struct Cliente {
     writer: Option<OwnedWriteHalf>,
     reader: Option<Lines<BufReader<OwnedReadHalf>>>,
     bici_activa: Option<BiciAlquilada>,
-    dinero: u32,
+    dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
 }
 
@@ -42,7 +42,7 @@ impl Actor for Cliente {
 }
 
 impl Cliente {
-    fn new(cliente_id: u32, coords: (f64, f64), dinero: u32) -> Self {
+    fn new(cliente_id: u32, coords: (f64, f64), dinero: f64) -> Self {
         Cliente {
             cliente_id,
             coords,
@@ -76,21 +76,18 @@ impl Cliente {
     }
 
     fn mostrar_dinero(&mut self) {
-        println!("[cliente] Mi dinero es: {}", self.dinero);
+        println!("[cliente] Mi dinero es: ${:.2}", self.dinero);
     }
 
     fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
-        let monto: u32 = monto.parse()
+        let monto: f64 = monto.parse()
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput,format!("'{}' no es un numero valido", monto),)
             })?;
 
-        self.dinero = self.dinero.checked_add(monto)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput,"La recarga excede el saldo máximo permitido",)
-            })?;
+        self.dinero += monto;
 
-        println!("[cliente] Recarga de ${}. Dinero actual: ${}", monto, self.dinero);
+        println!("[cliente] Recarga de ${:.2}. Dinero actual: ${:.2}", monto, self.dinero);
 
         Ok(())
     }
@@ -155,7 +152,7 @@ impl Cliente {
         Ok(())
     }
 
-    async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), dinero: u32, writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
+    async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), dinero: f64, writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
         let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords, dinero});
         println!("[cliente] Envia SolicitarBici");
         let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
@@ -178,12 +175,12 @@ impl Cliente {
         Ok(respuesta)
     }
 
-    fn descifrar_respuesta_de_ack_comprobante(&mut self, respuesta: Option<String>, dinero:  u32) {
+    fn descifrar_respuesta_de_ack_comprobante(&mut self, respuesta: Option<String>, dinero: f64) {
         if let Some(respuesta) = respuesta {
             match serde_json::from_str::<RespuestaSolicitarBici>(&respuesta) {
                 Ok(RespuestaSolicitarBici::AlquilerConfirmado(bici_confirmada)) => {
                     println!("Alquiler confirmado: bici {}", bici_confirmada.bici_id());
-                    println!("Dinero actual: {} -> {}", self.dinero, dinero);
+                    println!("Dinero actual: ${:.2} -> ${:.2}", self.dinero, dinero);
                     self.dinero = dinero; //recien aca que es el ultimo control
                     self.bici_activa = Some(bici_confirmada);
                 }
@@ -195,7 +192,7 @@ impl Cliente {
         }
     }
 
-    fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<(BiciAlquilada, u32), io::Error> {
+    fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<(BiciAlquilada, f64), io::Error> {
         match respuesta.as_deref().and_then(|l| serde_json::from_str::<RespuestaSolicitarBici>(l).ok()) {
             Some(RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)) => {
                 println!("[cliente] Recibe ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
@@ -250,7 +247,7 @@ impl Cliente {
         match respuesta {
             RespuestaDevolverBici::DevolucionOk(bici, dinero) => {
                 println!("Devolucion exitosa: bici {}", bici.bici_id);
-                println!("Dinero actual: {} -> {}", self.dinero, dinero);
+                println!("Dinero actual: ${:.2} -> ${:.2}", self.dinero, dinero);
 
                 self.dinero = dinero;
                 self.bici_activa = None;
@@ -359,7 +356,7 @@ mod tests {
     use matenmutex::types::Bici;
 
     fn cliente_de_prueba() -> Cliente {
-        Cliente::new(1, (-34.6037, -58.3816), 9999999)
+        Cliente::new(1, (-34.6037, -58.3816), 9999999.0)
     }
 
     fn bici_alquilada_de_prueba(bici_id: &str) -> BiciAlquilada {
@@ -393,7 +390,7 @@ mod tests {
 
         cliente.manejar_respuesta_devolver(RespuestaDevolverBici::DevolucionOk(Bici {
             bici_id: "1-1".to_string(),
-        }, 0));
+        }, 0.0));
 
         assert!(cliente.bici_activa.is_none());
     }
