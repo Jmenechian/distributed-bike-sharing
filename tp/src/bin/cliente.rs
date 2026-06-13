@@ -60,7 +60,7 @@ impl Cliente {
         Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero))
     }
 
-    fn actualizar_posicion(&mut self, str_x: &str, str_y: &str) -> Result<(), io::Error> {
+    fn mover(&mut self, str_x: &str, str_y: &str) -> Result<(), io::Error> {
         let x = str_x.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada x invalida: '{str_x}' debe representar un número.")))?;
         let y = str_y.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada y invalida: '{str_y}' debe representar un número.")))?;
         self.coords = (x, y);
@@ -313,7 +313,7 @@ async fn main() {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
         let result = match parts.as_slice() {
-            ["actualizar_posicion", x, y] => cliente.actualizar_posicion(x, y),
+            ["mover", x, y] => cliente.mover(x, y),
             ["conectar_sede", n] => cliente.conectar(n).await,
             ["solicitar_bici"] => cliente.solicitar_bici().await,
             ["devolver_bici"] => cliente.devolver_bici().await,
@@ -339,7 +339,7 @@ fn listar_comandos() {
     println!(
         "\n{BOLD_CYAN}=== Mate&Mutex CLI ==={RESET}\n\
          {BOLD}Comandos disponibles:{RESET}\n\
-         {GREEN}  actualizar_posicion <x> <y> {RESET}   - Moverse una distancia\n\
+         {GREEN}  mover <x> <y>{RESET}                  - Moverse una distancia\n\
          {GREEN}  conectar_sede <n>{RESET}              - Conectar a una sede\n\
          {GREEN}  solicitar_bici{RESET}                 - Solicitar una bici\n\
          {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
@@ -411,21 +411,21 @@ mod tests {
     }
 
     #[test]
-    fn actualizar_posicion_del_cliente_es_valido() {
+    fn mover_del_cliente_es_valido() {
         let mut cliente = cliente_de_prueba();
         let expected_x = 40.0;
         let expected_y = 0.0;
-        assert!(cliente.actualizar_posicion(&expected_x.to_string(), &expected_y.to_string()).is_ok());
+        assert!(cliente.mover(&expected_x.to_string(), &expected_y.to_string()).is_ok());
         assert_eq!(cliente.coords.0, expected_x);
         assert_eq!(cliente.coords.1, expected_y);
     }
 
     #[test]
-    fn actualizar_posicion_con_valores_invalidos() {
+    fn mover_con_valores_invalidos() {
         let mut cliente = cliente_de_prueba();
         let invalid_x = "test";
         let invalid_y = "test";
 
-        assert!(cliente.actualizar_posicion(&invalid_x, &invalid_y).is_err());
+        assert!(cliente.mover(&invalid_x, &invalid_y).is_err());
     }
 }
