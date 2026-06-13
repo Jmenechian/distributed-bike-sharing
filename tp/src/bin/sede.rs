@@ -1,5 +1,6 @@
 use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
 use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::log;
 use matenmutex::slot;
 use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, EstadoSlot, EstadoSlotPersistido, ExportarEstado, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
@@ -214,15 +215,15 @@ impl Sede {
     async fn procesar_respuesta_preautorizacion(slots: Vec<Addr<Slot>>, sede_id: u32, cliente_id: u32, mut dinero: f64, token_secret: &[u8; 32], sede_addr: Addr<Sede>, idx: usize, bici_id: String, preautorizacion: Result<MsgProcesadorPagosASede, Error>) -> RespuestaSolicitarBici {
         match preautorizacion {
             Ok(MsgProcesadorPagosASede::PagoPreAutorizado { payment_request_id, pago_id }) => {
-                println!("[sede] Recibe PagoPreAutorizado (payment_request_id {}, pago_id {})", payment_request_id, pago_id);
+                log!("[sede] Recibe PagoPreAutorizado (payment_request_id {}, pago_id {})", payment_request_id, pago_id);
                 match Self::generar_comprobante(sede_id, cliente_id, &token_secret, bici_id) {
                     Err(_) => {
-                        println!("[sede] Envia AlquilerRechazado: error generando token");
+                        log!("[sede] Envia AlquilerRechazado: error generando token");
                         let _ = slots[idx].send(Cancelar).await;
                         RespuestaSolicitarBici::AlquilerRechazado(String::from("Error interno al generar el token de alquiler"))
                     }
                     Ok(bici) => {
-                        println!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
+                        log!("[sede] Envia ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                         let _ = sede_addr.send(GuardarReserva { alquiler_id: bici.alquiler_id().to_string(), slot_idx: idx, bici: bici.clone() }).await;
                         let _ = sede_addr.send(ActualizarDisponibilidadSolicitar).await;
                         let alquiler = crear_alquilerActivo(&bici, pago_id);
@@ -238,17 +239,17 @@ impl Sede {
                 }
             }
             Ok(MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo }) => {
-                println!("[sede] Recibe PagoRechazado (payment_request_id {}, motivo {})", payment_request_id, motivo);
+                log!("[sede] Recibe PagoRechazado (payment_request_id {}, motivo {})", payment_request_id, motivo);
                 let _ = slots[idx].send(Cancelar).await;
                 RespuestaSolicitarBici::AlquilerRechazado(format!("El procesador de pagos rechazo la pre-autorizacion: {}", motivo))
             }
             Ok(_) => {
-                println!("[sede] Respuesta inesperada del procesador de pagos");
+                log!("[sede] Respuesta inesperada del procesador de pagos");
                 let _ = slots[idx].send(Cancelar).await;
                 RespuestaSolicitarBici::AlquilerRechazado(String::from("Respuesta inesperada del procesador de pagos"))
             }
             Err(e) => {
-                println!("[sede] Error comunicandose con el procesador de pagos: {}", e);
+                log!("[sede] Error comunicandose con el procesador de pagos: {}", e);
                 let _ = slots[idx].send(Cancelar).await;
                 RespuestaSolicitarBici::AlquilerRechazado(String::from("No se pudo procesar el pago de pre-autorizacion"))
             }
@@ -261,7 +262,7 @@ impl Sede {
             match slot.send(ExportarEstado).await {
                 Ok(estado) => estados.push(estado),
                 Err(e) => {
-                    eprintln!("[persistencia] no se pudo exportar el estado de un slot: {e}");
+                    log!("[persistencia] no se pudo exportar el estado de un slot: {e}");
                     return None;
                 }
             }
@@ -333,7 +334,7 @@ impl Sede {
             let vencida = ahora.saturating_sub(sede.ultimo_update_ts) > LIVENESS_TIMEOUT;
             if vencida && sede.conectada {
                 sede.conectada = false;
-                println!("[sede {}]: la sede {} se considera CAIDA (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
+                log!("[sede {}]: la sede {} se considera CAIDA (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
             }
         }
     }
@@ -440,7 +441,7 @@ impl Handler<NotificarDevolucion> for Sede {
 
     fn handle(&mut self, msg: NotificarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
 
-        println!("[sede] Recibí notificación de devolución");
+        log!("[sede] Recibí notificación de devolución");
 
         let alquiler_id = msg.alquiler_id.clone();
 
@@ -464,7 +465,7 @@ impl Handler<VerificarRoboMasTarde> for Sede {
             {
                 match alquiler.estado {
                     EstadoAlquiler::Activo => {
-                        println!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
+                        log!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
                         alquiler.estado = EstadoAlquiler::RoboConfirmado;
 
                     }
@@ -496,13 +497,13 @@ impl Handler<SolicitarBici> for Sede {
     fn handle(&mut self, msg: SolicitarBici, ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
             let motivo = String::from("Para poder tomar la bici debe estar mas cerca de la sede");
-            println!("[sede] Envia AlquilerRechazado: {}", motivo);
+            log!("[sede] Envia AlquilerRechazado: {}", motivo);
             return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(motivo) });
         }
 
         if !self.cliente_tiene_dinero_solicitar(msg.dinero) {
             let motivo = format!("Para poder tomar la bici debe tener mas dinero (Minimo ${:.2})", PREMONTO);
-            println!("[sede] Envia AlquilerRechazado: {}", motivo);
+            log!("[sede] Envia AlquilerRechazado: {}", motivo);
             return Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(motivo) });
         }
 
@@ -518,7 +519,7 @@ impl Handler<SolicitarBici> for Sede {
         Box::pin(async move {
             match Self::reservar_bici(&slots).await {
                 None => {
-                    println!("[sede] Envia AlquilerRechazado: no hay slots disponibles");
+                    log!("[sede] Envia AlquilerRechazado: no hay slots disponibles");
                     RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay bicicletas disponibles en este momento"))
                 }
                 Some((idx, bici_id)) => {
@@ -528,7 +529,7 @@ impl Handler<SolicitarBici> for Sede {
                         cliente_id: cliente_id.to_string(),
                         monto_seguridad: PREMONTO as f64,
                     };
-                    println!("[sede] Envia {}", solicitud_pre_autorizacion.describir());
+                    log!("[sede] Envia {}", solicitud_pre_autorizacion.describir());
 
                     let preautorizacion = enviar_con_descubrimiento_de_lider(&procesador_pagos_addrs, &lider_cacheado, solicitud_pre_autorizacion).await;
                     Self::procesar_respuesta_preautorizacion(slots, sede_id, cliente_id, dinero, &token_secret, sede_addr, idx, bici_id, preautorizacion).await
@@ -638,13 +639,13 @@ fn escribir_snapshot_a(estado_path: &str, snapshot: &EstadoPersistenteSede) {
     let json = match serde_json::to_vec_pretty(snapshot) {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("[persistencia] no se pudo serializar el estado: {e}");
+            log!("[persistencia] no se pudo serializar el estado: {e}");
             return;
         }
     };
     let tmp = format!("{}.tmp", estado_path);
     if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, estado_path)) {
-        eprintln!("[persistencia] no se pudo escribir {}: {e}", estado_path);
+        log!("[persistencia] no se pudo escribir {}: {e}", estado_path);
     }
 }
 
@@ -663,11 +664,11 @@ impl Handler<AckComprobanteAlquiler> for Sede {
                 //     slot_idx,
                 // });
 
-                println!("[sede] Recibe AckComprobanteAlquiler (alquiler {}) confirmando slot {}", msg.alquiler_id, slot_idx);
+                log!("[sede] Recibe AckComprobanteAlquiler (alquiler {}) confirmando slot {}", msg.alquiler_id, slot_idx);
                 Box::pin(async move {
                     let _ = slots[slot_idx].send(Confirmar).await;
                     let _ = sede_addr.send(PersistirEstado).await; // Persistir DEBE completarse antes de responder AlquilerConfirmado
-                    println!("[sede] Envia AlquilerConfirmado (bici {})", bici.bici_id());
+                    log!("[sede] Envia AlquilerConfirmado (bici {})", bici.bici_id());
                     RespuestaSolicitarBici::AlquilerConfirmado(bici)
                 })
             }
@@ -702,7 +703,7 @@ impl Handler<DevolverBici> for Sede {
     fn handle(&mut self, msg: DevolverBici, ctx: &mut Context<Self>) -> Self::Result {
         if !self.cliente_en_rango(msg.coords) {
             let motivo = String::from("Para poder devolver la bici debe estar mas cerca de la sede");
-            println!("[sede] Envia DevolucionRechazada: {}", motivo);
+            log!("[sede] Envia DevolucionRechazada: {}", motivo);
             return Box::pin(async move { RespuestaDevolverBici::DevolucionRechazada(motivo) });
         }
 
@@ -710,7 +711,7 @@ impl Handler<DevolverBici> for Sede {
         match token::validar_token(msg.bici.token_alquiler(), &self.token_secret) {
             Err(e) => {
                 let motivo = format!("Token de alquiler invalido: {:?}", e);
-                println!("[sede] Envia DevolucionRechazada: {}", motivo);
+                log!("[sede] Envia DevolucionRechazada: {}", motivo);
                 return Box::pin(async move { RespuestaDevolverBici::DevolucionRechazada(motivo) });
             }
             Ok(_) => {}
@@ -719,7 +720,7 @@ impl Handler<DevolverBici> for Sede {
             Ok(costo) => costo,
             Err(respuesta) => {
                 if let RespuestaDevolverBici::DevolucionRechazada(ref motivo) = respuesta {
-                    println!("[sede] Envia DevolucionRechazada: {}", motivo);
+                    log!("[sede] Envia DevolucionRechazada: {}", motivo);
                 }
                 return Box::pin(async move { respuesta });
             }
@@ -737,22 +738,22 @@ impl Handler<DevolverBici> for Sede {
 
         Box::pin(async move {
             let cobro = Self::generar_msg_de_cobro(monto, alquiler_id.clone(), cliente_id.clone());
-            println!("[sede] Envia {}", cobro.describir());
+            log!("[sede] Envia {}", cobro.describir());
 
             match enviar_con_descubrimiento_de_lider(&procesador_pagos_addrs, &lider_cacheado, cobro).await {
                 Ok(MsgProcesadorPagosASede::PagoAceptado { payment_request_id, pago_id }) => {
-                    println!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoAceptado { payment_request_id, pago_id }.describir());
+                    log!("[sede] Recibe {}", MsgProcesadorPagosASede::PagoAceptado { payment_request_id, pago_id }.describir());
                 }
                 Ok(MsgProcesadorPagosASede::PagoRechazado { payment_request_id, motivo }) => {
-                    println!("[sede] Recibe PagoRechazado (payment_request_id {}, motivo {})", payment_request_id, motivo);
+                    log!("[sede] Recibe PagoRechazado (payment_request_id {}, motivo {})", payment_request_id, motivo);
                     return RespuestaDevolverBici::DevolucionRechazada(format!("El procesador de pagos rechazo el cobro: {}", motivo));
                 }
                 Ok(otra) => {
-                    println!("[sede] Recibe {}", otra.describir());
+                    log!("[sede] Recibe {}", otra.describir());
                     return RespuestaDevolverBici::DevolucionRechazada(String::from("Respuesta inesperada del procesador de pagos"));
                 }
                 Err(e) => {
-                    println!("[sede] Error comunicandose con el procesador de pagos: {}", e);
+                    log!("[sede] Error comunicandose con el procesador de pagos: {}", e);
                     return RespuestaDevolverBici::DevolucionRechazada(String::from("No se pudo procesar el cobro de la devolucion"));
                 }
             }
@@ -803,7 +804,7 @@ impl Handler<DevolverBici> for Sede {
 fn preparar_monto(dinero: f64, tiempo_inicio: u64) -> Result<f64, RespuestaDevolverBici> {
     let fin = timestamp_actual();
     let duracion = fin - tiempo_inicio;
-    println!("Duracion del alquiler: {}", duracion);
+    log!("Duracion del alquiler: {}", duracion);
     let costo = duracion as f64 * TASA;
 
     if costo > dinero {
@@ -845,8 +846,8 @@ impl Handler<Heartbeat> for Sede {
     type Result = ();
 
     fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
-        println!("[sede] Recibe Heartbeat de {}", msg.sede_id);
-        println!("[sede] info: {:?}", msg.info); //para debug
+        log!("[sede] Recibe Heartbeat de {}", msg.sede_id);
+        log!("[sede] info: {:?}", msg.info); //para debug
 
         let mut info = msg.info;
         // Liveness con hora local: "lo escuche recien", no la auto-reportada del emisor.
@@ -856,7 +857,7 @@ impl Handler<Heartbeat> for Sede {
         match self.sedes_conocidas.iter_mut().find(|s| s.sede_id == info.sede_id) {
             Some(sede) => {
                 if !sede.conectada {
-                    println!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
+                    log!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
                 }
                 *sede = info;
             }
@@ -1757,12 +1758,12 @@ async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -
         Ok(valor) => match serde_json::to_string(&valor) {
             Ok(json) => json + "\n",
             Err(e) => {
-                eprintln!("Error serializando respuesta: {}", e);
+                log!("Error serializando respuesta: {}", e);
                 String::from("ERROR:no se pudo serializar la respuesta\n")
             }
         },
         Err(e) => {
-            eprintln!("Error enviando mensaje al actor Sede: {}", e);
+            log!("Error enviando mensaje al actor Sede: {}", e);
             String::from("ERROR:la sede no pudo procesar el mensaje\n")
         }
     }
@@ -1786,6 +1787,7 @@ async fn main() {
 
     let sede_id = config.id;
     let n = config.id as u16;
+    matenmutex::utils::logger::init(&format!("sede{n}"));
     let num_slots = 20;
     let coords = (config.coord_x, config.coord_y);
 
@@ -1844,13 +1846,13 @@ async fn main() {
 
             let (len, peer) = match udp_rx.recv_from(&mut buf).await {
                 Ok(r) => r,
-                Err(e) => { eprintln!("UDP recv error: {}", e); continue; }
+                Err(e) => { log!("UDP recv error: {}", e); continue; }
             };
             match serde_json::from_slice::<MsgSedeHeartbeat>(&buf[..len]) {
                 Ok(MsgSedeHeartbeat::Heartbeat(msg)) => {
                     sede_rx.send(msg).await.ok();
                 }
-                Err(e) => eprintln!("UDP parse error from {}: {}", peer, e),
+                Err(e) => log!("UDP parse error from {}: {}", peer, e),
             }
         }
     });
@@ -2082,11 +2084,11 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
         let (socket, addr) = match public_listener.accept().await {
             Ok(conexion) => conexion,
             Err(e) => {
-                eprintln!("Error aceptando conexion entrante: {}", e);
+                log!("Error aceptando conexion entrante: {}", e);
                 continue;
             }
         };
-        println!("New connection from {}", addr);
+        log!("New connection from {}", addr);
         let sede = sede.clone();
 
         tokio::spawn(async move {
@@ -2114,18 +2116,18 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
                 };
 
                 if let Err(e) = writer.write_all(response.as_bytes()).await {
-                    eprintln!("Error escribiendo respuesta a {}: {}", addr, e);
+                    log!("Error escribiendo respuesta a {}: {}", addr, e);
                     break;
                 }
             }
-            println!("Connection from {} closed", addr);
+            log!("Connection from {} closed", addr);
         });
     }
 }
 
 pub async fn enviar_notificacion( addr: String, info: NotificarDevolucion) -> Result<AckDevolucion, String> {
 
-    println!("[sede] Intentando notificar devolucion a {}", addr);
+    log!("[sede] Intentando notificar devolucion a {}", addr);
 
     let mut stream = TcpStream::connect(&addr)
         .await
