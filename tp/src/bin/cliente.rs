@@ -103,10 +103,17 @@ impl Cliente {
     }
 
     fn print_sedes(sedes: &[SedeInfo], coords: (f64, f64)) {
-        for sede in sedes {
+        let mut ordenadas: Vec<&SedeInfo> = sedes.iter().collect();
+        ordenadas.sort_by(|a, b| {
+            calcular_distancia(a.coords, coords)
+                .total_cmp(&calcular_distancia(b.coords, coords))
+        });
+        for sede in ordenadas {
             let dist = calcular_distancia(sede.coords, coords);
+            let estado = if sede.conectada { "online" } else { "offline" };
             println!(
-                "Sede {} | distancia: {}m | slots disponibles: {} | slots vacios {}", sede.sede_id, dist, sede.slots_disponibles, sede.slots_vacios
+                "Sede {} | coords: ({:.4}, {:.4}) | estado: {} | distancia: {:.2}m | slots disponibles: {} | slots vacios {}",
+                sede.sede_id, sede.coords.0, sede.coords.1, estado, dist, sede.slots_disponibles, sede.slots_vacios
             )
         }
     }

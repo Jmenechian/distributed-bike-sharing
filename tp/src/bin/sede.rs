@@ -75,6 +75,8 @@ pub struct Sede {
     devoluciones_recibidas: Vec<DevolucionRecibida>,
     pagos_pendientes: Vec<PagoPendiente>,
     notificaciones_pendientes: Vec<NotificacionPendiente>,
+    offline: Arc<Mutex<bool>>,
+    estaba_offline: bool,
 }
 
 /// Arma la lista de direcciones de ProcesadorPagos a partir del .env.
@@ -330,11 +332,28 @@ impl Sede {
     /// Marca conectada=false a las sedes sin heartbeat reciente. Loguea solo la transicion vivo->caido.
     fn marcar_sedes_caidas(&mut self) {
         let ahora = timestamp_actual();
+
+        // Estando offline no escuchamos heartbeats, uso este otro flag
+        // para no marcar a las demás sedes como offline cuando realmente no es así.
+        if *self.offline.lock().unwrap_or_else(|e| e.into_inner()) {
+            self.estaba_offline = true;
+            return;
+        }
+
+        if self.estaba_offline {
+            self.estaba_offline = false;
+            for sede in self.sedes_conocidas.iter_mut() {
+                sede.ultimo_update_ts = ahora;
+            }
+            return;
+        }
+
         for sede in self.sedes_conocidas.iter_mut() {
             let vencida = ahora.saturating_sub(sede.ultimo_update_ts) > LIVENESS_TIMEOUT;
             if vencida && sede.conectada {
                 sede.conectada = false;
                 log!("[sede {}]: la sede {} se considera CAIDA (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
+                println!("[sede {}]: la sede {} esta OFFLINE (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
             }
         }
     }
@@ -466,6 +485,7 @@ impl Handler<VerificarRoboMasTarde> for Sede {
                 match alquiler.estado {
                     EstadoAlquiler::Activo => {
                         log!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
+                        println!("[sede] ¡Bici robada! El alquiler {} no fue devuelto", msg.alquiler_id);
                         alquiler.estado = EstadoAlquiler::RoboConfirmado;
 
                     }
@@ -858,6 +878,7 @@ impl Handler<Heartbeat> for Sede {
             Some(sede) => {
                 if !sede.conectada {
                     log!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
+                    println!("[sede {}]: la sede {} esta ONLINE de nuevo", self.sede_id, info.sede_id);
                 }
                 *sede = info;
             }
@@ -960,6 +981,8 @@ mod tests {
             devoluciones_recibidas: Vec::new(),
             pagos_pendientes: Vec::new(),
             notificaciones_pendientes: Vec::new(),
+            offline: Arc::new(Mutex::new(false)),
+            estaba_offline: false,
         }
             .start()
     }
@@ -1521,6 +1544,8 @@ mod tests {
             devoluciones_recibidas: Vec::new(),
             pagos_pendientes: Vec::new(),
             notificaciones_pendientes: Vec::new(),
+            offline: Arc::new(Mutex::new(false)),
+            estaba_offline: false,
         }
             .start()
     }
@@ -1815,7 +1840,10 @@ async fn main() {
     );
 
 
-    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info, procesador_pagos_addrs, estado);
+    let offline = Arc::new(Mutex::new(false));
+    let despertar = Arc::new(Notify::new());
+
+    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info, procesador_pagos_addrs, estado, offline.clone());
     sede.do_send(ActualizarSlots);
 
     let public_addr = format!("127.0.0.1:808{}", n);
@@ -1825,11 +1853,6 @@ async fn main() {
     let udp = Arc::new(UdpSocket::bind(&private_addr).await.unwrap());
 
     println!("Sede {} — publica: {}, interna: {}", n, public_addr, private_addr);
-
-    // Estado online/offline: lo mutua la CLI, lo leen el loop publico y el sender de heartbeats.
-    // El loop publico se duerme en despertar.notified() cuando esta offline.
-    let offline = Arc::new(Mutex::new(false));
-    let despertar = Arc::new(Notify::new());
 
     // receiver
     let udp_rx = udp.clone();
@@ -1860,28 +1883,23 @@ async fn main() {
     let udp_tx = udp.clone();
     let sede_tx = sede.clone();
     let offline_hb = offline.clone();
+    let despertar_hb = despertar.clone();
     let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
 
     tokio::spawn(async move {
-        let mut bootstrapped = false; //para no pegarle a todos lados
-
-
         loop {
-            // Offline: no anunciamos heartbeats. El propio sleep nos despierta a revisar de nuevo.
+            // Offline: no anunciamos heartbeats. Dormimos hasta que la CLI nos despierte al volver online.
             if *offline_hb.lock().unwrap_or_else(|e| e.into_inner()) {
-                sleep(Duration::from_secs(HEARTBEAT_INTERVAL)).await;
+                despertar_hb.notified().await;
                 continue;
             }
 
             let info = sede_tx.send(GetInfo).await.unwrap();
-            let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
 
-            let targets: Vec<String> = if !bootstrapped {
-                bootstrapped = true;
-                other_sedes.iter().map(|s| format!("127.0.0.1:700{}", s)).collect()
-            } else {
-                sedes_conocidas.iter().map(|s| format!("127.0.0.1:700{}", s.sede_id)).collect()
-            };
+            let targets: Vec<String> = other_sedes
+                .iter()
+                .map(|s| format!("127.0.0.1:700{}", s))
+                .collect();
 
             let heartbeat = serde_json::to_vec(
                 &MsgSedeHeartbeat::Heartbeat(Heartbeat { sede_id, info })
@@ -2016,6 +2034,7 @@ fn crear_sede(
     sede_info: SedeInfo,
     procesador_pagos_addrs: Vec<String>,
     estado: EstadoPersistenteSede,
+    offline: Arc<Mutex<bool>>,
 ) -> Addr<Sede> {
     let pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)> = estado
         .pending_reservas
@@ -2038,6 +2057,8 @@ fn crear_sede(
         devoluciones_recibidas: estado.devoluciones_recibidas,
         pagos_pendientes: estado.pagos_pendientes,
         notificaciones_pendientes: estado.notificaciones_pendientes,
+        offline,
+        estaba_offline: false,
     }
         .start();
     sede

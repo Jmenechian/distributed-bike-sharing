@@ -32,6 +32,7 @@ fn timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let secs = secs - 3 * 3600; // Para poner el horario de Arg que es UTC-3
     format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }
 
