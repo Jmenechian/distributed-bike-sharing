@@ -299,7 +299,36 @@ fn crear_devolucion(bici: BiciAlquilada, sede_destino_id: u32, fin_ts: u64, mont
         monto,
         pago_id: Some("".to_string()),
         estado_pago: EstadoConciliacion::Confirmado,
-        estado_notificacion_origen: EstadoConciliacion::Confirmado,
+        estado_notificacion_origen: EstadoConciliacion::Pendiente,
+    }
+}
+
+fn crear_notificacion_pendiente(n: &NotificarDevolucion) -> NotificacionPendiente {
+    NotificacionPendiente {
+        alquiler_id: n.alquiler_id.clone(),
+        bici_id: n.bici_id.clone(),
+        cliente_id: n.cliente_id.clone(),
+        sede_origen_id: n.sede_origen_id,
+        sede_destino_id: n.sede_destino_id,
+        fin_ts: n.fin_ts,
+        monto: n.monto,
+        pago_id: n.pago_id.clone(),
+        token_alquiler: n.token_alquiler.clone(),
+        intentos: 0,
+    }
+}
+
+fn notificacion_pendiente_a_devolucion(p: &NotificacionPendiente) -> NotificarDevolucion {
+    NotificarDevolucion {
+        alquiler_id: p.alquiler_id.clone(),
+        bici_id: p.bici_id.clone(),
+        cliente_id: p.cliente_id.clone(),
+        sede_origen_id: p.sede_origen_id,
+        sede_destino_id: p.sede_destino_id,
+        fin_ts: p.fin_ts,
+        monto: p.monto,
+        pago_id: p.pago_id.clone(),
+        token_alquiler: p.token_alquiler.clone(),
     }
 }
 
@@ -316,6 +345,25 @@ fn crear_notificacion_devolucion(d: DevolucionRecibida, token: String) -> Notifi
         token_alquiler: token,
     }
 }
+fn generar_captura_deposito(alquiler_id: String, cliente_id: String) -> MsgSedeAProcesadorPagos {
+    MsgSedeAProcesadorPagos::CobrarPago {
+        payment_request_id: Uuid::new_v4().to_string(),
+        alquiler_id,
+        cliente_id,
+        monto_final: PREMONTO,
+    }
+}
+
+fn generar_reembolso_deposito(alquiler_id: String, cliente_id: String) -> MsgSedeAProcesadorPagos {
+    MsgSedeAProcesadorPagos::ReembolsarPago {
+        payment_request_id: Uuid::new_v4().to_string(),
+        alquiler_id,
+        cliente_id,
+        pago_original_id: String::new(),
+        monto_reembolso: PREMONTO,
+    }
+}
+
 impl Actor for Sede {
     type Context = Context<Self>;
 
@@ -458,11 +506,23 @@ impl Handler<RemoverAlquiler> for Sede {
 impl Handler<NotificarDevolucion> for Sede {
     type Result = MessageResult<NotificarDevolucion>;
 
-    fn handle(&mut self, msg: NotificarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: NotificarDevolucion, ctx: &mut Self::Context) -> Self::Result {
 
         log!("[sede] Recibí notificación de devolución");
 
         let alquiler_id = msg.alquiler_id.clone();
+
+        // Si el alquiler estaba marcado como robo, esta devolución tardía lo revierte
+        // (el deposito se lo reintegra el cliente en la sede destino).
+        if let Some(alquiler) = self.alquileres_activos.iter_mut().find(|a| a.alquiler_id == alquiler_id) {
+            if matches!(alquiler.estado, EstadoAlquiler::RoboConfirmado) {
+                alquiler.estado = EstadoAlquiler::RoboRevertido;
+                log!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", alquiler_id);
+                println!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", alquiler_id);
+                ctx.address().do_send(PersistirEstado);
+                return MessageResult(AckDevolucion { alquiler_id });
+            }
+        }
 
         if self.alquiler_ya_procesado(&alquiler_id) { //idempotencia
             return MessageResult(AckDevolucion {alquiler_id: msg.alquiler_id});
@@ -477,24 +537,90 @@ impl Handler<NotificarDevolucion> for Sede {
 impl Handler<VerificarRoboMasTarde> for Sede {
     type Result = ();
     fn handle(&mut self, msg: VerificarRoboMasTarde, ctx: &mut Context<Self>) -> Self::Result {
-        ctx.run_later(Duration::from_secs(60), move |act, _ctx| {
-            if let Some(alquiler) = act.alquileres_activos
+        ctx.run_later(Duration::from_secs(60), move |act, ctx| {
+            let cliente_id = match act.alquileres_activos
                 .iter_mut()
                 .find(|a| a.alquiler_id == msg.alquiler_id)
             {
-                match alquiler.estado {
-                    EstadoAlquiler::Activo => {
-                        log!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
-                        println!("[sede] ¡Bici robada! El alquiler {} no fue devuelto", msg.alquiler_id);
-                        alquiler.estado = EstadoAlquiler::RoboConfirmado;
-
-                    }
-                    _ => {}
+                Some(alquiler) if matches!(alquiler.estado, EstadoAlquiler::Activo) => {
+                    log!("[sede] Bici del alquiler {} no fue devuelta, marcando como robada", msg.alquiler_id);
+                    println!("[sede] ¡Bici robada! El alquiler {} no fue devuelto", msg.alquiler_id);
+                    alquiler.estado = EstadoAlquiler::RoboConfirmado;
+                    alquiler.cliente_id.clone()
                 }
-            }
+                _ => return,
+            };
+
+            let alquiler_id = msg.alquiler_id.clone();
+            let cobro = generar_captura_deposito(alquiler_id.clone(), cliente_id);
+            let addrs = act.procesador_pagos_addrs.clone();
+            let cache = act.lider_cacheado.clone();
+            let sede_addr = ctx.address();
+            log!("[sede] Retengo multa de robo (${}) por alquiler {}", PREMONTO, alquiler_id);
+            println!("[sede] Multa de robo retenida (${}) por alquiler {}", PREMONTO, alquiler_id);
+
+            tokio::spawn(async move {
+                match enviar_con_descubrimiento_de_lider(&addrs, &cache, cobro).await {
+                    Ok(MsgProcesadorPagosASede::PagoAceptado { pago_id, .. }) => {
+                        sede_addr.do_send(GuardarPagoMulta { alquiler_id, pago_id });
+                    }
+                    Ok(otra) => log!("[sede] Captura de multa: respuesta inesperada {}", otra.describir()),
+                    Err(e) => log!("[sede] Captura de multa: error con el procesador de pagos: {}", e),
+                }
+            });
         });
     }
 }
+
+struct GuardarPagoMulta {
+    alquiler_id: String,
+    pago_id: String,
+}
+
+impl Message for GuardarPagoMulta {
+    type Result = ();
+}
+
+impl Handler<GuardarPagoMulta> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: GuardarPagoMulta, ctx: &mut Self::Context) {
+        if let Some(alquiler) = self.alquileres_activos
+            .iter_mut()
+            .find(|a| a.alquiler_id == msg.alquiler_id)
+        {
+            alquiler.pago_multa_id = Some(msg.pago_id);
+            ctx.address().do_send(PersistirEstado);
+        }
+    }
+}
+
+struct RevertirRoboLocal {
+    alquiler_id: String,
+    reembolso_id: String,
+}
+
+impl Message for RevertirRoboLocal {
+    type Result = ();
+}
+
+impl Handler<RevertirRoboLocal> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: RevertirRoboLocal, ctx: &mut Self::Context) {
+        if let Some(alquiler) = self.alquileres_activos
+            .iter_mut()
+            .find(|a| a.alquiler_id == msg.alquiler_id)
+        {
+            alquiler.estado = EstadoAlquiler::RoboRevertido;
+            alquiler.reembolso_multa_id = Some(msg.reembolso_id);
+            log!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", msg.alquiler_id);
+            println!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", msg.alquiler_id);
+            ctx.address().do_send(PersistirEstado);
+        }
+    }
+}
+
 impl Handler<PedirSedes> for Sede {
     type Result = MessageResult<PedirSedes>;
 
@@ -717,6 +843,76 @@ impl Handler<ConfirmarNotificacionOrigen> for Sede {
     }
 }
 
+struct EncolarNotificacionPendiente {
+    notificacion: NotificarDevolucion,
+}
+
+impl Message for EncolarNotificacionPendiente {
+    type Result = ();
+}
+
+impl Handler<EncolarNotificacionPendiente> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: EncolarNotificacionPendiente, ctx: &mut Self::Context) {
+        let alquiler_id = msg.notificacion.alquiler_id.clone();
+        let origen = msg.notificacion.sede_origen_id;
+        self.notificaciones_pendientes.push(crear_notificacion_pendiente(&msg.notificacion));
+        ctx.address().do_send(PersistirEstado);
+        log!("[sede {}]: no pude avisar la devolucion del alquiler {} a la sede {}, queda pendiente", self.sede_id, alquiler_id, origen);
+        println!("[sede {}]: tengo una bici de la sede {} (alquiler {}) pero no pude avisarle, queda PENDIENTE", self.sede_id, origen, alquiler_id);
+    }
+}
+
+struct RemoverNotificacionPendiente {
+    alquiler_id: String,
+}
+
+impl Message for RemoverNotificacionPendiente {
+    type Result = ();
+}
+
+impl Handler<RemoverNotificacionPendiente> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: RemoverNotificacionPendiente, ctx: &mut Self::Context) {
+        self.notificaciones_pendientes.retain(|p| p.alquiler_id != msg.alquiler_id);
+        ctx.address().do_send(PersistirEstado);
+    }
+}
+
+struct FlushNotificacionesPendientes;
+
+impl Message for FlushNotificacionesPendientes {
+    type Result = ();
+}
+
+impl Handler<FlushNotificacionesPendientes> for Sede {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, _msg: FlushNotificacionesPendientes, ctx: &mut Self::Context) -> Self::Result {
+        let pendientes = self.notificaciones_pendientes.clone();
+        let sede_addr = ctx.address();
+        let sede_id = self.sede_id;
+
+        Box::pin(async move {
+            for pendiente in pendientes {
+                let notificacion = notificacion_pendiente_a_devolucion(&pendiente);
+                let addr = format!("127.0.0.1:888{}", pendiente.sede_origen_id);
+                match enviar_notificacion(addr, notificacion).await {
+                    Ok(ack) => {
+                        log!("[sede {}]: reenvie la devolucion pendiente del alquiler {} a la sede {}", sede_id, pendiente.alquiler_id, pendiente.sede_origen_id);
+                        println!("[sede {}]: avise a la sede {} que tengo su bici (alquiler {}) y cerre el pago", sede_id, pendiente.sede_origen_id, pendiente.alquiler_id);
+                        sede_addr.do_send(ConfirmarNotificacionOrigen { alquiler_id: ack.alquiler_id.clone() });
+                        sede_addr.do_send(RemoverNotificacionPendiente { alquiler_id: ack.alquiler_id });
+                    }
+                    Err(_) => {}
+                }
+            }
+        })
+    }
+}
+
 impl Handler<DevolverBici> for Sede {
     type Result = ResponseFuture<RespuestaDevolverBici>;
 
@@ -755,6 +951,9 @@ impl Handler<DevolverBici> for Sede {
         let cliente_id = msg.bici.cliente_id().to_string();
         let sede_id = self.sede_id.clone();
         let sedes_conocidas = self.sedes_conocidas.clone();
+        let offline = self.offline.clone();
+        let era_robo_local = self.alquileres_activos.iter()
+            .any(|a| a.alquiler_id == alquiler_id && matches!(a.estado, EstadoAlquiler::RoboConfirmado));
 
         Box::pin(async move {
             let cobro = Self::generar_msg_de_cobro(monto, alquiler_id.clone(), cliente_id.clone());
@@ -786,29 +985,46 @@ impl Handler<DevolverBici> for Sede {
                         let devolucion = crear_devolucion(msg.bici, sede_id, timestamp_actual(), monto as f64);
                         let notificacion_devolucion = crear_notificacion_devolucion(devolucion.clone(), bici.token_alquiler().parse().unwrap());
                         let _ = sede_addr.send(GuardarDevolucion {devolucion}).await;
-                        let _ = sede_addr.send(RemoverAlquiler { alquiler_id: alquiler_id.clone() }).await;
+
+                        if !era_robo_local {
+                            let _ = sede_addr.send(RemoverAlquiler { alquiler_id: alquiler_id.clone() }).await;
+                        }
+
+                        let reembolso = generar_reembolso_deposito(alquiler_id.clone(), cliente_id.clone());
+                        match enviar_con_descubrimiento_de_lider(&procesador_pagos_addrs, &lider_cacheado, reembolso).await {
+                            Ok(MsgProcesadorPagosASede::PagoReembolsado { pago_id, .. }) => {
+                                log!("[sede] Depósito (${}) reintegrado al cliente por alquiler {}", PREMONTO, alquiler_id);
+                                if era_robo_local {
+                                    sede_addr.do_send(RevertirRoboLocal { alquiler_id: alquiler_id.clone(), reembolso_id: pago_id });
+                                }
+                            }
+                            Ok(otra) => log!("[sede] Reembolso de depósito: respuesta inesperada {}", otra.describir()),
+                            Err(e) => log!("[sede] Reembolso de depósito: error con el procesador de pagos: {}", e),
+                        }
                         let _ = sede_addr.send(PersistirEstado).await;
 
                         let sede_origen_id = notificacion_devolucion.sede_origen_id;
 
-                        let sede_origen = sedes_conocidas.iter()
-                        .find(|sede| sede.sede_id == sede_origen_id && sede.conectada);
+                        let yo_offline = *offline.lock().unwrap_or_else(|e| e.into_inner());
+                        let origen_conectada = sedes_conocidas.iter()
+                            .any(|sede| sede.sede_id == sede_origen_id && sede.conectada);
 
-                        match sede_origen {
-                            None => {}
-                            Some(info) => {
-                                let addr = format!("127.0.0.1:888{}", sede_origen_id);
-                                match enviar_notificacion(addr, notificacion_devolucion).await {
+                        if yo_offline || !origen_conectada {
+                            sede_addr.do_send(EncolarNotificacionPendiente { notificacion: notificacion_devolucion });
+                        } else {
+                            let addr = format!("127.0.0.1:888{}", sede_origen_id);
+                            match enviar_notificacion(addr, notificacion_devolucion.clone()).await {
                                 Ok(ack) => {
                                     let _ = sede_addr.send(ConfirmarNotificacionOrigen { alquiler_id: ack.alquiler_id}).await;
                                 }
-                                    Err(_) => {}
+                                Err(_) => {
+                                    sede_addr.do_send(EncolarNotificacionPendiente { notificacion: notificacion_devolucion });
                                 }
                             }
                         }
 
 
-                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto);
+                        return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto + PREMONTO);
                     }
                     _ => continue,
                 }
@@ -865,7 +1081,7 @@ impl Handler<PreguntarBicis> for Sede {
 impl Handler<Heartbeat> for Sede {
     type Result = ();
 
-    fn handle(&mut self, msg: Heartbeat, _ctx: &mut Context<Self>) -> () {
+    fn handle(&mut self, msg: Heartbeat, ctx: &mut Context<Self>) -> () {
         log!("[sede] Recibe Heartbeat de {}", msg.sede_id);
         log!("[sede] info: {:?}", msg.info); //para debug
 
@@ -879,6 +1095,7 @@ impl Handler<Heartbeat> for Sede {
                 if !sede.conectada {
                     log!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
                     println!("[sede {}]: la sede {} esta ONLINE de nuevo", self.sede_id, info.sede_id);
+                    ctx.address().do_send(FlushNotificacionesPendientes);
                 }
                 *sede = info;
             }
@@ -1915,7 +2132,7 @@ async fn main() {
 
     let sede_sede_addr = format!("127.0.0.1:888{}", n);
     let sede_sede_listener = TcpListener::bind(&sede_sede_addr).await.unwrap();
-    tokio::spawn(loop_cli(offline.clone(), despertar.clone()));
+    tokio::spawn(loop_cli(sede.clone(), offline.clone(), despertar.clone()));
 
     tokio::spawn(loop_sedes(sede.clone(), sede_sede_listener, offline, despertar));
 
@@ -1923,7 +2140,7 @@ async fn main() {
 }
 
 /// CLI de la sede: muta el estado online/offline. Al volver online despierta al loop publico.
-async fn loop_cli(offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
+async fn loop_cli(sede: Addr<Sede>, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
     println!("Comandos de la sede: online | offline");
 
     let stdin = tokio::io::stdin();
@@ -1938,6 +2155,9 @@ async fn loop_cli(offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
             "online" => {
                 *offline.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 despertar.notify_waiters(); // despierta a loop_sedes y al receiver, ambos esperando
+                // El flush no puede depender de dónde quedó parado loop_sedes (puede estar
+                // bloqueado en accept y perderse el notify), así que lo disparamos acá.
+                sede.do_send(FlushNotificacionesPendientes);
                 println!("[sede] online");
             }
             "" => {}
@@ -1954,6 +2174,7 @@ async fn loop_sedes(sede: Addr<Sede>, listener: TcpListener, offline: Arc<Mutex<
             println!("[sede] offline — aislada de otras sedes, esperando online");
             despertar.notified().await;
             println!("[sede] online — reanudando comunicacion entre sedes");
+            sede.do_send(FlushNotificacionesPendientes);
         }
 
         let (socket, _) = listener.accept().await.unwrap();
