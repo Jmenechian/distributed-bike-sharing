@@ -5,6 +5,7 @@ use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use matenmutex::log;
 use matenmutex::messages::procesador_procesador_pagos::MsgProcesadorAProcesador;
 use matenmutex::messages::procesadores::MsgProcesador;
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
@@ -18,8 +19,6 @@ use matenmutex::utils::tiempos::{TiemposBuilder, Tiempos};
 const CONFIG_FILE: usize = 1;
 const MINIMAL_LENGTH: usize = 2;
 
-const COLOR_2PC: &str = "\x1b[36m";
-const COLOR_RESET: &str = "\x1b[0m";
 const PUERTO_BASE: u16 = 6000;
 const PUERTO_BASE_2PC: u16 = PUERTO_BASE + 1000;
 
@@ -237,17 +236,18 @@ impl ProcesadorPagos {
         let json = match serde_json::to_vec_pretty(&snapshot) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("[persistencia] no se pudo serializar el estado: {e}");
+                log!("[persistencia] no se pudo serializar el estado: {e}");
                 return;
             }
         };
         let tmp = format!("{}.tmp", self.estado_path);
         if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &self.estado_path)) {
-            eprintln!("[persistencia] no se pudo escribir {}: {e}", self.estado_path);
+            log!("[persistencia] no se pudo escribir {}: {e}", self.estado_path);
         }
     }
 
     async fn init(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        matenmutex::utils::logger::init(&format!("procesador{}", self.procesador_id));
         tokio::spawn(self.clone().heartbeat_loop());
         tokio::spawn(self.clone().monitor_loop());
         tokio::spawn(self.clone().accept_loop_sedes());
@@ -259,10 +259,10 @@ impl ProcesadorPagos {
         loop {
             match self.public_listener.accept().await {
                 Ok((socket, addr)) => {
-                    println!("[NODO {}]: Nueva conexion de Sede desde {}", self.procesador_id, addr);
+                    log!("[NODO {}]: Nueva conexion de Sede desde {}", self.procesador_id, addr);
                     tokio::spawn(self.clone().atender_sede(socket));
                 }
-                Err(e) => println!("[{}]: error aceptando sede: {}", self.etiqueta(), e),
+                Err(e) => log!("[{}]: error aceptando sede: {}", self.etiqueta(), e),
             }
         }
     }
@@ -274,18 +274,18 @@ impl ProcesadorPagos {
         while let Ok(Some(line)) = lines.next_line().await {
             let resp = match serde_json::from_str::<MsgSedeAProcesadorPagos>(line.trim()) {
                 Ok(msg) => {
-                    println!("[procesador_pagos] Recibe {}", msg.describir());
+                    log!("[procesador_pagos] Recibe {}", msg.describir());
                     self.procesar_pago(msg).await
                 }
                 Err(_) => {
-                    println!("[procesador_pagos] Recibe mensaje invalido: {}", line.trim());
+                    log!("[procesador_pagos] Recibe mensaje invalido: {}", line.trim());
                     MsgProcesadorPagosASede::PagoRechazado {
                         payment_request_id: String::new(),
                         motivo: format!("mensaje invalido: {}", line.trim()),
                     }
                 }
             };
-            println!("[procesador_pagos] Envia {}", resp.describir());
+            log!("[procesador_pagos] Envia {}", resp.describir());
             let payload = match serde_json::to_string(&resp) {
                 Ok(json) => json + "\n",
                 Err(_) => continue,
@@ -477,7 +477,7 @@ impl ProcesadorPagos {
     /// de linea, acotada por self.tiempos.espera_ok. Devuelve None ante
     /// fallo de conexion, envio, timeout o deserializacion.
     async fn solicitar_2pc(&self, addr: SocketAddr, msg: &MsgProcesadorAProcesador) -> Option<MsgProcesadorAProcesador> {
-        println!("{}[{}]: 2PC envia {} a {}{}", COLOR_2PC, self.etiqueta(), msg.describir(), addr, COLOR_RESET);
+        log!("[{}]: 2PC envia {} a {}", self.etiqueta(), msg.describir(), addr);
 
         let respuesta: Option<MsgProcesadorAProcesador> = tokio::time::timeout(self.tiempos.espera_ok, async {
             let stream = TcpStream::connect(addr).await.ok()?;
@@ -494,8 +494,8 @@ impl ProcesadorPagos {
         .flatten();
 
         match &respuesta {
-            Some(resp) => println!("{}[{}]: 2PC recibe {} de {}{}", COLOR_2PC, self.etiqueta(), resp.describir(), addr, COLOR_RESET),
-            None => println!("{}[{}]: 2PC sin respuesta de {} (timeout o conexion fallida){}", COLOR_2PC, self.etiqueta(), addr, COLOR_RESET),
+            Some(resp) => log!("[{}]: 2PC recibe {} de {}", self.etiqueta(), resp.describir(), addr),
+            None => log!("[{}]: 2PC sin respuesta de {} (timeout o conexion fallida)", self.etiqueta(), addr),
         }
 
         respuesta
@@ -507,10 +507,10 @@ impl ProcesadorPagos {
         loop {
             match self.bus_2pc.accept().await {
                 Ok((socket, addr)) => {
-                    println!("{}[{}]: Nueva conexion 2PC desde {}{}", COLOR_2PC, self.etiqueta(), addr, COLOR_RESET);
+                    log!("[{}]: Nueva conexion 2PC desde {}", self.etiqueta(), addr);
                     tokio::spawn(self.clone().atender_procesador(socket));
                 }
-                Err(e) => println!("[{}]: error aceptando conexion 2PC: {}", self.etiqueta(), e),
+                Err(e) => log!("[{}]: error aceptando conexion 2PC: {}", self.etiqueta(), e),
             }
         }
     }
@@ -525,17 +525,17 @@ impl ProcesadorPagos {
         while let Ok(Some(line)) = lines.next_line().await {
             let resp = match serde_json::from_str::<MsgProcesadorAProcesador>(line.trim()) {
                 Ok(msg) => {
-                    println!("{}[{}]: 2PC recibe {}{}", COLOR_2PC, self.etiqueta(), msg.describir(), COLOR_RESET);
+                    log!("[{}]: 2PC recibe {}", self.etiqueta(), msg.describir());
                     self.manejar_mensaje_procesador_a_procesador(msg)
                 }
                 Err(_) => {
-                    println!("{}[{}]: 2PC recibe mensaje invalido: {}{}", COLOR_2PC, self.etiqueta(), line.trim(), COLOR_RESET);
+                    log!("[{}]: 2PC recibe mensaje invalido: {}", self.etiqueta(), line.trim());
                     None
                 }
             };
 
             let Some(resp) = resp else { continue };
-            println!("{}[{}]: 2PC envia {}{}", COLOR_2PC, self.etiqueta(), resp.describir(), COLOR_RESET);
+            log!("[{}]: 2PC envia {}", self.etiqueta(), resp.describir());
             let payload = match serde_json::to_string(&resp) {
                 Ok(json) => json + "\n",
                 Err(_) => continue,
@@ -726,7 +726,7 @@ impl ProcesadorPagos {
         match self.rol_actual.lock() {
             Ok(rol) => Some(*rol),
             Err(e) => {
-                println!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
+                log!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
                 None
             }
         }
@@ -735,7 +735,7 @@ impl ProcesadorPagos {
     fn set_rol(&self, nuevo: RolActual) {
         match self.rol_actual.lock() {
             Ok(mut rol) => *rol = nuevo,
-            Err(e) => println!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e),
+            Err(e) => log!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e),
         }
     }
 
@@ -746,7 +746,7 @@ impl ProcesadorPagos {
         let mut rol = match self.rol_actual.lock() {
             Ok(rol) => rol,
             Err(e) => {
-                println!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
+                log!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
                 return;
             }
         };
@@ -758,7 +758,7 @@ impl ProcesadorPagos {
         if debe_ser_replica {
             *rol = RolActual::Replica { lider_id: lider_emisor };
             drop(rol); //
-            println!("[NODO {}]: heartbeat de lider {} con id mayor: me subordino como REPLICA", self.procesador_id, lider_emisor);
+            log!("[NODO {}]: heartbeat de lider {} con id mayor: me subordino como REPLICA", self.procesador_id, lider_emisor);
         }
     }
 
@@ -773,7 +773,7 @@ impl ProcesadorPagos {
                 }
             }
             Err(e) => {
-                println!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
+                log!("[NODO {}]: Mutex de rol_actual envenenado: {}", self.procesador_id, e);
                 false
             }
         }
@@ -783,7 +783,7 @@ impl ProcesadorPagos {
         match self.recibio_ok.lock() {
             Ok(flag) => *flag,
             Err(e) => {
-                println!("[NODO {}]: Mutex de recibio_ok envenenado: {}", self.procesador_id, e);
+                log!("[NODO {}]: Mutex de recibio_ok envenenado: {}", self.procesador_id, e);
                 false
             }
         }
@@ -792,7 +792,7 @@ impl ProcesadorPagos {
     fn set_recibio_ok(&self, valor: bool) {
         match self.recibio_ok.lock() {
             Ok(mut flag) => *flag = valor,
-            Err(e) => println!("[NODO {}]: Mutex de recibio_ok envenenado: {}", self.procesador_id, e),
+            Err(e) => log!("[NODO {}]: Mutex de recibio_ok envenenado: {}", self.procesador_id, e),
         }
     }
 
@@ -826,13 +826,13 @@ impl ProcesadorPagos {
             for (addr, estado) in transiciones {
                 match estado {
                     EstadoNodo::Caido => {
-                        println!(
+                        log!(
                             "[{}]: Procesador en {} se considera CAIDO (sin noticias hace mas de {}s)",
                             etiqueta, addr, self.tiempos.liveness_timeout.as_secs()
                         );
                         Self::handlear_caida(&self, &etiqueta, addr);
                     }
-                    EstadoNodo::Vivo => println!(
+                    EstadoNodo::Vivo => log!(
                         "[{}]: Procesador en {} volvio a estar VIVO",
                         etiqueta, addr
                     ),
@@ -865,7 +865,7 @@ impl ProcesadorPagos {
         let mut mapa = match self.liveness.lock() {
             Ok(mapa) => mapa,
             Err(e) => {
-                println!("[{}]: Mutex de liveness envenenado: {}", etiqueta, e);
+                log!("[{}]: Mutex de liveness envenenado: {}", etiqueta, e);
                 return Vec::new();
             }
         };
@@ -881,7 +881,7 @@ impl ProcesadorPagos {
                     .or_insert(InfoNodo { ultimo_visto: Instant::now(), estado: EstadoNodo::Vivo });
             }
             Err(e) => {
-                println!("[{}]: Mutex de liveness envenenado: {}", etiqueta, e);
+                log!("[{}]: Mutex de liveness envenenado: {}", etiqueta, e);
             }
         }
     }
@@ -893,7 +893,7 @@ impl ProcesadorPagos {
             Some(RolActual::Replica { lider_id }) if lider_id == id_caido
         );
         if es_mi_lider {
-            println!("[{}]: El lider {} cayo", etiqueta, id_caido);
+            log!("[{}]: El lider {} cayo", etiqueta, id_caido);
             Self::lanzar_eleccion(nodo);
         }
     }
@@ -908,12 +908,12 @@ impl ProcesadorPagos {
                             Self::handle_msg(&self, from, msg).await;
                         }
                         Err(e) => {
-                            println!("[{}]: Mensaje invalido de {}: {}", self.etiqueta(), from, e);
+                            log!("[{}]: Mensaje invalido de {}: {}", self.etiqueta(), from, e);
                         }
                     }
                 }
                 Err(e) => {
-                    println!("[{}]: Fallo al recibir datagrama: {}", self.etiqueta(), e);
+                    log!("[{}]: Fallo al recibir datagrama: {}", self.etiqueta(), e);
                 }
             }
         }
@@ -923,7 +923,7 @@ impl ProcesadorPagos {
     /// mensaje se refresca el liveness de un nodo
     async fn handle_msg(nodo: &Arc<Self>, from: SocketAddr, msg: MsgProcesador) {
         let etiqueta = nodo.etiqueta();
-        println!("[{}]: Mensaje recibido de {}: {:?}", etiqueta, from, msg);
+        log!("[{}]: Mensaje recibido de {}: {:?}", etiqueta, from, msg);
 
         nodo.actualizar_liveness(&etiqueta, from);
 
@@ -935,7 +935,7 @@ impl ProcesadorPagos {
                 nodo.enviar_heartbeat_ack(from).await;
             }
             MsgProcesador::HeartbeatAck { procesador_id: emisor_id } => {
-                println!(
+                log!(
                     "[{}]: HeartbeatAck recibido del procesador {} ({})",
                     etiqueta, emisor_id, from
                 );
@@ -944,11 +944,11 @@ impl ProcesadorPagos {
                 Self::handlear_eleccion(nodo, from).await;
             }
             MsgProcesador::Ok { procesador_id: emisor_id } => {
-                println!("[{}]: Ok de {} ({}): hay un nodo mayor vivo", etiqueta, emisor_id, from);
+                log!("[{}]: Ok de {} ({}): hay un nodo mayor vivo", etiqueta, emisor_id, from);
                 nodo.set_recibio_ok(true);
             }
             MsgProcesador::Coordinador { lider_id } => {
-                println!("[{}]: Coordinador: el nuevo lider es {} ({})", etiqueta, lider_id, from);
+                log!("[{}]: Coordinador: el nuevo lider es {} ({})", etiqueta, lider_id, from);
                 nodo.set_rol(RolActual::Replica { lider_id });
             }
         }
@@ -965,7 +965,7 @@ impl ProcesadorPagos {
 
     fn lanzar_eleccion(nodo: &Arc<Self>) {
         if nodo.intentar_pasar_a_candidato() {
-            println!("[{}]: Inicio una eleccion (bully)", nodo.etiqueta());
+            log!("[{}]: Inicio una eleccion (bully)", nodo.etiqueta());
             tokio::spawn(nodo.clone().correr_eleccion());
         }
     }
@@ -995,14 +995,14 @@ impl ProcesadorPagos {
             if !matches!(self.rol(), Some(RolActual::Candidato)) {
                 return;
             }
-            println!("[{}]: No llego Coordinador a tiempo, reinicio la eleccion", self.etiqueta());
+            log!("[{}]: No llego Coordinador a tiempo, reinicio la eleccion", self.etiqueta());
         }
     }
 
     /// Se proclama líder y lo difunde con Coordinador.
     async fn proclamarse_lider(&self) {
         self.set_rol(RolActual::Lider);
-        println!("[{}]: Gane la eleccion: me proclamo LIDER", self.etiqueta());
+        log!("[{}]: Gane la eleccion: me proclamo LIDER", self.etiqueta());
         let coordinador = MsgProcesador::Coordinador { lider_id: self.procesador_id };
         self.enviar_a(&self.peers, &coordinador).await;
         self.recuperar_transacciones_huerfanas().await;
@@ -1084,14 +1084,14 @@ impl ProcesadorPagos {
         let payload = match serde_json::to_vec(msg) {
             Ok(payload) => payload,
             Err(e) => {
-                println!("[{}]: Error serializando {:?}: {}", etiqueta, msg, e);
+                log!("[{}]: Error serializando {:?}: {}", etiqueta, msg, e);
                 return;
             }
         };
         for destino in destinos {
             match self.socket.send_to(&payload, destino).await {
-                Ok(_) => println!("[{}]: {:?} enviado a {}", etiqueta, msg, destino),
-                Err(e) => println!("[{}]: Error enviando {:?} a {}: {}", etiqueta, msg, destino, e),
+                Ok(_) => log!("[{}]: {:?} enviado a {}", etiqueta, msg, destino),
+                Err(e) => log!("[{}]: Error enviando {:?} a {}: {}", etiqueta, msg, destino, e),
             }
         }
     }
