@@ -234,7 +234,10 @@ impl Cliente {
         let (writer, reader) = self.validar_conexion()?;
         let msg = MsgClienteASede::PreguntarBicis(PreguntarBicis {});
         if let Some(linea) = enviar_mensaje_a_sede(writer, reader, msg).await? {
-            println!("Sede: {}", linea);
+            match serde_json::from_str::<String>(&linea) {
+                Ok(texto) => println!("{}", texto),
+                Err(_) => println!("{}", linea),
+            }
         }
         Ok(())
     }

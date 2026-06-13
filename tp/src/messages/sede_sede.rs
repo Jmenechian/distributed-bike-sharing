@@ -1,23 +1,13 @@
-use std::sync::Arc;
 use actix::Message;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use crate::messages::cliente_sede::SolicitarBici;
-use crate::messages::sede_cliente::RespuestaSolicitarBici;
 use crate::types::timestamp_actual;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum MsgSedeHeartbeat {
     Heartbeat(Heartbeat),
-    // HeartbeatAck { sede_id: u32 },
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum MsgSedeASede {
-    NotificarDevolucion(NotificarDevolucion),
-}
-
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Heartbeat {
     pub sede_id: u32,
     pub info: SedeInfo,
@@ -26,8 +16,12 @@ pub struct Heartbeat {
 impl Message for Heartbeat {
     type Result = ();
 }
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum MsgSedeASede {
+    NotificarDevolucion(NotificarDevolucion),
+}
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SedeInfo{
     pub sede_id: u32,
     pub coords: (f64, f64),
@@ -83,7 +77,7 @@ impl Message for GetSedesConocidas {
 // Alquileres
 // ##############################
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AlquilerActivo {
     pub alquiler_id: String, //
     pub bici_id: String, //
@@ -98,7 +92,7 @@ pub struct AlquilerActivo {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum EstadoAlquiler {
     Activo,
     Sospechoso,
@@ -107,7 +101,7 @@ pub enum EstadoAlquiler {
     RoboRevertido,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DevolucionRecibida {
     pub alquiler_id: String,
     pub bici_id: String,
@@ -137,6 +131,8 @@ pub enum TipoPagoPendiente {
     ReembolsoPenalizacion,
 }
 
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NotificacionPendiente {
     pub alquiler_id: String,
     pub bici_id: String,
@@ -151,7 +147,7 @@ pub struct NotificacionPendiente {
 
 
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum EstadoConciliacion {
     Pendiente,
     Confirmado,
@@ -174,7 +170,15 @@ impl Message for GuardarDevolucion {
     type Result = ();
 }
 
-#[derive(Serialize, Deserialize)]
+pub struct RemoverAlquiler {
+    pub alquiler_id: String,
+}
+
+impl Message for RemoverAlquiler {
+    type Result = ();
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NotificarDevolucion {
     pub alquiler_id: String,
     pub bici_id: String,

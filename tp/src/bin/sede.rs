@@ -1,9 +1,9 @@
 use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
 use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::slot;
-use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, Reservar, ResultadoReserva, SetSlotCounts, Slot};
+use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, EstadoSlot, EstadoSlotPersistido, ExportarEstado, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
-use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada};
+use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada, PagoPendiente};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
@@ -15,7 +15,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, VerificarRoboMasTarde};
+use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, RemoverAlquiler, VerificarRoboMasTarde};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
 use std::io;
@@ -33,19 +33,46 @@ struct SedeConfig {
     coord_y: f64,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct EstadoPersistenteSede {
+    slots: Vec<EstadoSlotPersistido>,
+    pending_reservas: Vec<(String, usize, BiciAlquilada)>,
+    alquileres_activos: Vec<AlquilerActivo>,
+    devoluciones_recibidas: Vec<DevolucionRecibida>,
+    pagos_pendientes: Vec<PagoPendiente>,
+    notificaciones_pendientes: Vec<NotificacionPendiente>,
+}
+
+fn estado_path_de_id(sede_id: u32) -> String {
+    format!("estado_sede_{}.json", sede_id)
+}
+
+/// Lee el snapshot de disco. Si el archivo no existe, arranca con estado vacio (primer boot).
+fn cargar_estado(path: &str) -> Result<EstadoPersistenteSede, Box<dyn std::error::Error>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(EstadoPersistenteSede::default()),
+        Err(e) => return Err(format!("no se pudo abrir el estado en {path}: {e}").into()),
+    };
+    serde_json::from_reader(StdBufReader::new(file))
+        .map_err(|e| format!("estado corrupto en {path}: {e}").into())
+}
+
 pub struct Sede {
     sede_id: u32,
     coords: (f64, f64),
     slots: Vec<Addr<Slot>>,
-    alquileres_activos: Vec<AlquilerActivo>,
-    devoluciones_recibidas: Vec<DevolucionRecibida>,
     token_secret: [u8; SECRET_LEN],
     pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)>,
     sedes_conocidas: Vec<SedeInfo>,
     sede_info: SedeInfo,
     procesador_pagos_addrs: Vec<String>,
-    // online: bool,
     lider_cacheado: Arc<Mutex<Option<String>>>,
+    estado_path: String,
+    alquileres_activos: Vec<AlquilerActivo>,
+    devoluciones_recibidas: Vec<DevolucionRecibida>,
+    pagos_pendientes: Vec<PagoPendiente>,
+    notificaciones_pendientes: Vec<NotificacionPendiente>,
 }
 
 /// Arma la lista de direcciones de ProcesadorPagos a partir del .env.
@@ -200,6 +227,7 @@ impl Sede {
                         let alquiler = crear_alquilerActivo(&bici, pago_id);
                         let alquiler_id = bici.clone().alquiler_id;
                         let _ = sede_addr.send(GuardarAlquiler {alquiler}).await;
+                        let _ = sede_addr.send(PersistirEstado).await;
 
                         sede_addr.do_send(VerificarRoboMasTarde {alquiler_id, slot_idx: idx});
 
@@ -225,6 +253,20 @@ impl Sede {
             }
         }
     }
+
+    async fn snapshot_slots(slots: &[Addr<Slot>]) -> Option<Vec<EstadoSlotPersistido>> {
+        let mut estados = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match slot.send(ExportarEstado).await {
+                Ok(estado) => estados.push(estado),
+                Err(e) => {
+                    eprintln!("[persistencia] no se pudo exportar el estado de un slot: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(estados)
+    }
 }
 
 fn crear_alquilerActivo(bici: &BiciAlquilada, pago_preautorizado: String) -> AlquilerActivo {
@@ -243,6 +285,7 @@ fn crear_alquilerActivo(bici: &BiciAlquilada, pago_preautorizado: String) -> Alq
 }
 
 fn crear_devolucion(bici: BiciAlquilada, sede_destino_id: u32, fin_ts: u64, monto: f64) -> DevolucionRecibida {
+
     DevolucionRecibida {
         alquiler_id: bici.alquiler_id().to_string(),
         bici_id: bici.bici_id().to_string(),
@@ -320,7 +363,6 @@ impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
     type Result = ();
 
     fn handle(&mut self, _msg: ActualizarDisponibilidadSolicitar, _ctx: &mut Self::Context) -> Self::Result {
-
         self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_sub(1);
         self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_add(1);
         self.sede_info.ultimo_update_ts = timestamp_actual();
@@ -330,7 +372,7 @@ impl Handler<ActualizarDisponibilidadSolicitar> for Sede {
 impl Handler<ActualizarDisponibilidadDevolver> for Sede { //maybe algo que revise los slots? por ahora bien basicon
     type Result = ();
 
-    fn handle(&mut self, msg: ActualizarDisponibilidadDevolver, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, _msg: ActualizarDisponibilidadDevolver, _ctx: &mut Self::Context) -> Self::Result {
         self.sede_info.slots_disponibles = self.sede_info.slots_disponibles.saturating_add(1);
         self.sede_info.slots_vacios      = self.sede_info.slots_vacios.saturating_sub(1);
         self.sede_info.ultimo_update_ts = timestamp_actual();
@@ -381,6 +423,14 @@ impl Handler<GuardarDevolucion> for Sede {
 
     fn handle(&mut self, msg: GuardarDevolucion, _ctx: &mut Self::Context) -> Self::Result {
         self.devoluciones_recibidas.push(msg.devolucion);
+    }
+}
+
+impl Handler<RemoverAlquiler> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: RemoverAlquiler, _ctx: &mut Self::Context) -> Self::Result {
+        self.alquileres_activos.retain(|a| a.alquiler_id != msg.alquiler_id);
     }
 }
 
@@ -503,7 +553,7 @@ impl Handler<ActualizarSlots> for Sede {
             let resultados = futures::future::join_all(requests).await;
             let lineas: Vec<String> = resultados.into_iter().filter_map(|r| r.ok()).collect();
             let total = lineas.len();
-            let ocupados = lineas.iter().filter(|l| !l.contains("sin bici")).count();
+            let ocupados = lineas.iter().filter(|l| !l.contains("Vacio")).count();
             let vacios = total - ocupados;
 
             addr.do_send(SetSlotCounts { ocupados: ocupados as u8, vacios: vacios as u8 });
@@ -538,17 +588,84 @@ impl Handler<GuardarReserva> for Sede {
     }
 }
 
+struct PersistirEstado;
+
+impl actix::Message for PersistirEstado {
+    type Result = ();
+}
+
+impl Handler<PersistirEstado> for Sede {
+    type Result = ResponseFuture<()>;
+
+    fn handle(&mut self, _msg: PersistirEstado, _ctx: &mut Context<Self>) -> Self::Result {
+        let slots = self.slots.clone();
+        let pending_reservas: Vec<(String, usize, BiciAlquilada)> = self
+            .pending_reservas
+            .iter()
+            .map(|(alquiler_id, (slot_idx, bici))| (alquiler_id.clone(), *slot_idx, bici.clone()))
+            .collect();
+        let alquileres_activos = self.alquileres_activos.clone();
+        let devoluciones_recibidas = self.devoluciones_recibidas.clone();
+        let pagos_pendientes = self.pagos_pendientes.clone();
+        let notificaciones_pendientes = self.notificaciones_pendientes.clone();
+        let estado_path = self.estado_path.clone();
+
+        Box::pin(async move {
+            let slot_states = match Sede::snapshot_slots(&slots).await {
+                Some(estados) => estados,
+                None => return,
+            };
+
+            let snapshot = EstadoPersistenteSede {
+                slots: slot_states,
+                pending_reservas,
+                alquileres_activos,
+                devoluciones_recibidas,
+                pagos_pendientes,
+                notificaciones_pendientes,
+            };
+
+            escribir_snapshot_a(&estado_path, &snapshot);
+        })
+    }
+}
+
+fn escribir_snapshot_a(estado_path: &str, snapshot: &EstadoPersistenteSede) {
+    if estado_path.is_empty() {
+        return;
+    }
+    let json = match serde_json::to_vec_pretty(snapshot) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[persistencia] no se pudo serializar el estado: {e}");
+            return;
+        }
+    };
+    let tmp = format!("{}.tmp", estado_path);
+    if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, estado_path)) {
+        eprintln!("[persistencia] no se pudo escribir {}: {e}", estado_path);
+    }
+}
+
 impl Handler<AckComprobanteAlquiler> for Sede {
     type Result = ResponseFuture<RespuestaSolicitarBici>;
 
-    fn handle(&mut self, msg: AckComprobanteAlquiler, _ctx: &mut Context<Self>) -> Self::Result {
+    fn handle(&mut self, msg: AckComprobanteAlquiler, ctx: &mut Context<Self>) -> Self::Result {
         match self.pending_reservas.remove(&msg.alquiler_id) {
             None => Box::pin(async move { RespuestaSolicitarBici::AlquilerRechazado(String::from("No hay reserva pendiente para ese alquiler")) }),
             Some((slot_idx, bici)) => {
                 let slots = self.slots.clone();
+                let sede_addr = ctx.address();
+                // self.alquileres_activos.push(AlquilerActivo { //yo lo meti en solicitar_bici, ver si tal vez usar este
+                //     alquiler_id: msg.alquiler_id.clone(),
+                //     bici: bici.clone(),
+                //     slot_idx,
+                // });
+
                 println!("[sede] Recibe AckComprobanteAlquiler (alquiler {}) confirmando slot {}", msg.alquiler_id, slot_idx);
                 Box::pin(async move {
                     let _ = slots[slot_idx].send(Confirmar).await;
+                    let _ = sede_addr.send(PersistirEstado).await; // Persistir DEBE completarse antes de responder AlquilerConfirmado
                     println!("[sede] Envia AlquilerConfirmado (bici {})", bici.bici_id());
                     RespuestaSolicitarBici::AlquilerConfirmado(bici)
                 })
@@ -618,7 +735,7 @@ impl Handler<DevolverBici> for Sede {
         let sedes_conocidas = self.sedes_conocidas.clone();
 
         Box::pin(async move {
-            let cobro = Self::generar_msg_de_cobro(monto, alquiler_id, cliente_id);
+            let cobro = Self::generar_msg_de_cobro(monto, alquiler_id.clone(), cliente_id.clone());
             println!("[sede] Envia {}", cobro.describir());
 
             match enviar_con_descubrimiento_de_lider(&procesador_pagos_addrs, &lider_cacheado, cobro).await {
@@ -639,7 +756,7 @@ impl Handler<DevolverBici> for Sede {
                 }
             }
 
-            for slot in slots.iter() {
+            for (slot_idx, slot) in slots.iter().enumerate() {
                 match slot.send(AsegurarBici { bici_id: bici_id.clone() }).await {
                     Ok(true) => {
                         let _ = sede_addr.send(ActualizarDisponibilidadDevolver).await;
@@ -647,6 +764,8 @@ impl Handler<DevolverBici> for Sede {
                         let devolucion = crear_devolucion(msg.bici, sede_id, timestamp_actual(), monto as f64);
                         let notificacion_devolucion = crear_notificacion_devolucion(devolucion.clone(), bici.token_alquiler().parse().unwrap());
                         let _ = sede_addr.send(GuardarDevolucion {devolucion}).await;
+                        let _ = sede_addr.send(RemoverAlquiler { alquiler_id: alquiler_id.clone() }).await;
+                        let _ = sede_addr.send(PersistirEstado).await;
 
                         let sede_origen_id = notificacion_devolucion.sede_origen_id;
 
@@ -704,15 +823,18 @@ impl Handler<PreguntarBicis> for Sede {
             .map(|slot| slot.send(ConsultarBici)) // mensaje a cada slot
             .collect();
 
+        let sede_id = self.sede_id;
+
         Box::pin(async move {
             let resultados = futures::future::join_all(requests).await;
             let lineas: Vec<String> = resultados.into_iter().filter_map(|r| r.ok()).collect();
 
-            let ocupados = lineas.iter().filter(|l| !l.contains("sin bici")).count();
+            let ocupados = lineas.iter().filter(|l| !l.contains("Vacio")).count();
             let total = lineas.len();
 
-            let mut respuesta = lineas.join("   ");
-            respuesta.push_str(&format!("--- {}/{} slots ocupados ---", ocupados, total));
+            let mut respuesta = format!("=== Estado de Sede {} ===\n", sede_id);
+            respuesta.push_str(&lineas.join("\n"));
+            respuesta.push_str(&format!("\n--- {}/{} slots ocupados ---", ocupados, total));
             respuesta
         })
     }
@@ -825,14 +947,17 @@ mod tests {
             sede_id: 1,
             coords: (-34.6037, -58.3816),
             slots,
-            alquileres_activos: vec![],
-            devoluciones_recibidas: vec![],
             token_secret: token::cargar_secret("secreto-de-test"),
             pending_reservas: std::collections::HashMap::new(),
             sedes_conocidas: vec![],
             sede_info: dummy_info,
             procesador_pagos_addrs: vec![procesador_pagos_addr],
             lider_cacheado: Arc::new(Mutex::new(None)),
+            estado_path: String::new(),
+            alquileres_activos: Vec::new(),
+            devoluciones_recibidas: Vec::new(),
+            pagos_pendientes: Vec::new(),
+            notificaciones_pendientes: Vec::new(),
         }
             .start()
     }
@@ -1108,7 +1233,7 @@ mod tests {
 
         match respuesta {
             RespuestaSolicitarBici::AlquilerRechazado(_) => {}
-            other => panic!("Se esperaba alquiler rechazaddo por falta de dinero")
+            _ => panic!("Se esperaba alquiler rechazaddo por falta de dinero")
         }
     }
 
@@ -1135,7 +1260,7 @@ mod tests {
 
 
     #[actix_rt::test]
-    async fn devolver_Bici_sin_dinero_suficiente_rechaza() {
+    async fn devolver_bici_sin_dinero_suficiente_rechaza() {
         let sede = sede_con_estados(vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }]);
 
         let respuesta = sede
@@ -1228,13 +1353,9 @@ mod tests {
             other => panic!("se esperaba AlquilerRechazado, se obtuvo {:?}", other),
         }
 
-        // El slot debe haber vuelto a Disponible (no quedo Reservado), por
-        // lo que una nueva reserva sobre el mismo slot debe ser posible.
         let resultado = sede.send(ConsultarEstadoSlot { idx: 0 }).await.unwrap();
         assert_eq!(resultado, ResultadoReserva::Reservada("1-1".to_string()));
     }
-
-    // ---- parsear_addrs_procesador_pagos ----
 
     #[test]
     fn parsear_addrs_usa_lista_separada_por_comas_con_espacios() {
@@ -1263,10 +1384,6 @@ mod tests {
         assert_eq!(addrs, vec![PROCESADOR_PAGOS_ADDR_DEFAULT.to_string()]);
     }
 
-    // ---- enviar_con_descubrimiento_de_lider ----
-
-    /// Levanta un nodo de prueba que responde siempre el mismo mensaje
-    /// (NoSoyLider o una respuesta normal) a cualquier mensaje recibido.
     async fn stub_nodo_pagos(respuesta: MsgProcesadorPagosASede) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1321,7 +1438,6 @@ mod tests {
 
     #[tokio::test]
     async fn descubrimiento_salta_nodo_caido_y_encuentra_al_lider() {
-        // Direccion en la que no hay nada escuchando: conexion fallara.
         let nodo_caido = "127.0.0.1:1".to_string();
         let lider = stub_nodo_pagos(MsgProcesadorPagosASede::PagoPreAutorizado {
             payment_request_id: "pr-test".to_string(),
@@ -1344,7 +1460,6 @@ mod tests {
             pago_id: "pago-1".to_string(),
         })
         .await;
-        // Nodo que rechazaria con NoSoyLider si llegara a ser consultado.
         let replica = stub_nodo_pagos(MsgProcesadorPagosASede::NoSoyLider { lider_addr: None }).await;
         let nodos = vec![replica, lider.clone()];
         let cache = Arc::new(Mutex::new(Some(lider.clone())));
@@ -1385,6 +1500,234 @@ mod tests {
         assert_eq!(*cache.lock().unwrap(), None);
     }
 
+    fn sede_con_estados_path_y_procesador(estados: Vec<EstadoSlot>, procesador_pagos_addr: String, estado_path: String) -> Addr<Sede> {
+        let dummy_info = rellenar_ocupados_vacios_testing(&estados);
+        let slots = crear_slots_con_estados(estados);
+
+        Sede {
+            sede_id: 1,
+            coords: (-34.6037, -58.3816),
+            slots,
+            token_secret: token::cargar_secret("secreto-de-test"),
+            pending_reservas: std::collections::HashMap::new(),
+            sedes_conocidas: vec![],
+            sede_info: dummy_info,
+            procesador_pagos_addrs: vec![procesador_pagos_addr],
+            lider_cacheado: Arc::new(Mutex::new(None)),
+            estado_path,
+            alquileres_activos: Vec::new(),
+            devoluciones_recibidas: Vec::new(),
+            pagos_pendientes: Vec::new(),
+            notificaciones_pendientes: Vec::new(),
+        }
+            .start()
+    }
+
+    fn path_temporal(nombre: &str) -> String {
+        let mut path = std::env::temp_dir();
+        path.push(format!("{nombre}-{}.json", Uuid::new_v4()));
+        path.to_string_lossy().to_string()
+    }
+
+    #[actix_rt::test]
+    async fn ack_comprobante_alquiler_persiste_alquiler_activo_y_slot_no_disponible_antes_de_responder() {
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let path = path_temporal("estado_sede_ack");
+        let sede = sede_con_estados_path_y_procesador(
+            vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }],
+            procesador_addr,
+            path.clone(),
+        );
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 42,
+                coords: (-34.6037, -58.3816),
+                dinero: MAX_VALUE,
+            })
+            .await
+            .unwrap();
+
+        let bici = match respuesta {
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, _) => bici,
+            other => panic!("se esperaba ComprobanteAlquilerEmitido, se obtuvo {:?}", other),
+        };
+
+        let alquiler_id = bici.alquiler_id().to_string();
+        let respuesta_final = sede.send(AckComprobanteAlquiler { alquiler_id: alquiler_id.clone() }).await.unwrap();
+        assert!(matches!(respuesta_final, RespuestaSolicitarBici::AlquilerConfirmado(_)));
+
+        let contenido = std::fs::read_to_string(&path).expect("el snapshot debe haberse escrito");
+        let snapshot: EstadoPersistenteSede = serde_json::from_str(&contenido).unwrap();
+
+        assert!(
+            !snapshot.slots.iter().any(|s| matches!(s, EstadoSlotPersistido::Disponible { bici_id } if bici_id == "1-1")),
+            "el slot no debe quedar Disponible tras confirmar el alquiler"
+        );
+
+        assert!(
+            snapshot.alquileres_activos.iter().any(|a| a.alquiler_id == alquiler_id),
+            "alquileres_activos debe contener el alquiler confirmado"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tmp"));
+    }
+
+    #[actix_rt::test]
+    async fn devolver_bici_persiste_devolucion_y_remueve_alquiler_activo() {
+        let procesador_addr = stub_procesador_pagos(false).await;
+        let path = path_temporal("estado_sede_devolver");
+        let sede = sede_con_estados_path_y_procesador(
+            vec![EstadoSlot::Disponible { bici_id: "1-1".to_string() }, EstadoSlot::Vacio],
+            procesador_addr,
+            path.clone(),
+        );
+
+        let respuesta = sede
+            .send(SolicitarBici {
+                cliente_id: 42,
+                coords: (-34.6037, -58.3816),
+                dinero: MAX_VALUE,
+            })
+            .await
+            .unwrap();
+        let bici = match respuesta {
+            RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, _) => bici,
+            other => panic!("se esperaba ComprobanteAlquilerEmitido, se obtuvo {:?}", other),
+        };
+        let alquiler_id = bici.alquiler_id().to_string();
+        sede.send(AckComprobanteAlquiler { alquiler_id: alquiler_id.clone() }).await.unwrap();
+
+        sede.send(DevolverBici {
+            bici,
+            coords: (-34.6037, -58.3816),
+            dinero: MAX_VALUE,
+        })
+            .await
+            .unwrap();
+
+        let contenido = std::fs::read_to_string(&path).expect("el snapshot debe haberse escrito");
+        let snapshot: EstadoPersistenteSede = serde_json::from_str(&contenido).unwrap();
+
+        assert!(
+            !snapshot.alquileres_activos.iter().any(|a| a.alquiler_id == alquiler_id),
+            "el alquiler debe haberse removido de alquileres_activos"
+        );
+        assert!(
+            snapshot.devoluciones_recibidas.iter().any(|d| d.alquiler_id == alquiler_id),
+            "debe registrarse la devolucion"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.tmp"));
+    }
+
+    #[test]
+    fn cargar_estado_sin_archivo_devuelve_default() {
+        let path = path_temporal("estado_sede_inexistente");
+        let estado = cargar_estado(&path).unwrap();
+        assert!(estado.slots.is_empty());
+        assert!(estado.alquileres_activos.is_empty());
+    }
+
+    #[test]
+    fn cargar_estado_con_archivo_corrupto_aborta() {
+        let path = path_temporal("estado_sede_corrupto");
+        std::fs::write(&path, "esto no es json valido").unwrap();
+
+        let resultado = cargar_estado(&path);
+        assert!(resultado.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cargar_estado_con_archivo_valido_rehidrata_colecciones() {
+
+        let path = path_temporal("estado_sede_valido");
+        let bici = BiciAlquilada::new("1-2".to_string(), "alq-1".to_string(), "c-1".to_string(), 1, 1000, "tok".to_string());
+        let alquiler = crear_alquilerActivo(&bici, "hola".parse().unwrap());
+        let snapshot = EstadoPersistenteSede {
+            slots: vec![EstadoSlotPersistido::Vacio, EstadoSlotPersistido::Disponible { bici_id: "1-1".to_string() }],
+            pending_reservas: vec![],
+            alquileres_activos: vec![alquiler],
+            devoluciones_recibidas: vec![],
+            pagos_pendientes: vec![],
+            notificaciones_pendientes: vec![],
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+
+        let estado = cargar_estado(&path).unwrap();
+        assert_eq!(estado.slots.len(), 2);
+        assert_eq!(estado.alquileres_activos.len(), 1);
+        assert_eq!(estado.alquileres_activos[0].alquiler_id, "alq-1");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn construir_estados_con_limbo_downgradea_reservado_sin_alquiler_activo() {
+        let estado = EstadoPersistenteSede {
+            slots: vec![EstadoSlotPersistido::Reservado { bici_id: "1-1".to_string() }],
+            pending_reservas: vec![],
+            alquileres_activos: vec![],
+            devoluciones_recibidas: vec![],
+            pagos_pendientes: vec![],
+            notificaciones_pendientes: vec![],
+        };
+
+        let estados = construir_estados_con_limbo(&estado);
+
+        match &estados[0] {
+            EstadoSlot::Disponible { bici_id } => assert_eq!(bici_id, "1-1"),
+            _ => panic!("se esperaba Disponible (limbo downgrade)"),
+        }
+    }
+
+    #[test]
+    fn construir_estados_con_limbo_mantiene_reservado_con_alquiler_activo() {
+        let bici = BiciAlquilada::new("1-1".to_string(), "alq-1".to_string(), "c-1".to_string(), 1, 1000, "tok".to_string());
+        let alquiler = crear_alquilerActivo(&bici, "hola".parse().unwrap());
+        let estado = EstadoPersistenteSede {
+            slots: vec![EstadoSlotPersistido::Reservado { bici_id: "1-1".to_string() }],
+            pending_reservas: vec![],
+            alquileres_activos: vec![alquiler],
+            devoluciones_recibidas: vec![],
+            pagos_pendientes: vec![],
+            notificaciones_pendientes: vec![],
+        };
+
+        let estados = construir_estados_con_limbo(&estado);
+
+        match &estados[0] {
+            EstadoSlot::Reservado { bici_id } => assert_eq!(bici_id, "1-1"),
+            _ => panic!("se esperaba Reservado (respaldado por AlquilerActivo)"),
+        }
+    }
+
+    #[test]
+    fn construir_estados_con_limbo_mapea_vacio_y_disponible_sin_cambios() {
+        let estado = EstadoPersistenteSede {
+            slots: vec![EstadoSlotPersistido::Vacio, EstadoSlotPersistido::Disponible { bici_id: "1-2".to_string() }],
+            pending_reservas: vec![],
+            alquileres_activos: vec![],
+            devoluciones_recibidas: vec![],
+            pagos_pendientes: vec![],
+            notificaciones_pendientes: vec![],
+        };
+
+        let estados = construir_estados_con_limbo(&estado);
+
+        match &estados[0] {
+            EstadoSlot::Vacio => {}
+            _ => panic!("se esperaba Vacio"),
+        }
+        match &estados[1] {
+            EstadoSlot::Disponible { bici_id } => assert_eq!(bici_id, "1-2"),
+            _ => panic!("se esperaba Disponible"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1425,8 +1768,6 @@ async fn formatear_respuesta<T: Serialize>(resultado: Result<T, MailboxError>) -
 
 }
 
-
-
 #[actix_rt::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -1445,11 +1786,25 @@ async fn main() {
     let sede_id = config.id;
     let n = config.id as u16;
     let num_slots = 20;
-    let slots: Vec<Addr<Slot>> = slot::crear_slots(sede_id, num_slots);
     let coords = (config.coord_x, config.coord_y);
 
-    let sede_info = crear_sede_info(n, sede_id, coords);
+    let estado_path = estado_path_de_id(sede_id);
+    let estado = match cargar_estado(&estado_path) {
+        Ok(estado) => estado,
+        Err(e) => {
+            eprintln!("Error fatal cargando el estado de la sede: {e}");
+            return;
+        }
+    };
 
+    let snapshot_existente = !estado.slots.is_empty();
+    let slots: Vec<Addr<Slot>> = if snapshot_existente {
+        slot::crear_slots_con_estados(construir_estados_con_limbo(&estado))
+    } else {
+        slot::crear_slots(sede_id, num_slots)
+    };
+
+    let sede_info = crear_sede_info(n, sede_id, coords);
 
     let procesador_pagos_addrs = parsear_addrs_procesador_pagos(
         env::var("PROCESADOR_PAGOS_ADDRS").ok().as_deref(),
@@ -1457,7 +1812,7 @@ async fn main() {
     );
 
 
-    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info, procesador_pagos_addrs);
+    let sede = crear_sede(token_secret, sede_id, slots, coords, sede_info, procesador_pagos_addrs, estado);
     sede.do_send(ActualizarSlots);
 
     let public_addr = format!("127.0.0.1:808{}", n);
@@ -1468,7 +1823,6 @@ async fn main() {
 
     println!("Sede {} — publica: {}, interna: {}", n, public_addr, private_addr);
 
-    // receiver
     let udp_rx = udp.clone();
     let sede_rx = sede.clone();
     tokio::spawn(async move {
@@ -1487,21 +1841,14 @@ async fn main() {
         }
     });
 
-    // sender
     let udp_tx = udp.clone();
     let sede_tx = sede.clone();
     let other_sedes: Vec<u16> = (1..=5).filter(|&s| s != n).collect(); //pego random a un par
-
-    // let pair = Arc::new((Mutex::new(true), Condvar::new()));
-
     tokio::spawn(async move {
         let mut bootstrapped = false; //para no pegarle a todos lados
 
 
         loop {
-
-
-
             let info = sede_tx.send(GetInfo).await.unwrap();
             let sedes_conocidas = sede_tx.send(GetSedesConocidas).await.unwrap();
 
@@ -1586,19 +1933,55 @@ fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
     }
 }
 
-fn crear_sede(token_secret: [u8; 32], sede_id: u32, slots: Vec<Addr<Slot>>, coords: (f64, f64), sede_info: SedeInfo, procesador_pagos_addrs: Vec<String>) -> Addr<Sede> {
+fn construir_estados_con_limbo(estado: &EstadoPersistenteSede) -> Vec<EstadoSlot> {
+    estado
+        .slots
+        .iter()
+        .cloned()
+        .map(|slot_persistido| match slot_persistido {
+            EstadoSlotPersistido::Reservado { bici_id } => {
+                let respaldado = estado.alquileres_activos.iter().any(|a| a.bici_id == bici_id);
+                if respaldado {
+                    EstadoSlot::Reservado { bici_id }
+                } else {
+                    EstadoSlot::Disponible { bici_id }
+                }
+            }
+            otro => EstadoSlot::from(otro),
+        })
+        .collect()
+}
+
+fn crear_sede(
+    token_secret: [u8; 32],
+    sede_id: u32,
+    slots: Vec<Addr<Slot>>,
+    coords: (f64, f64),
+    sede_info: SedeInfo,
+    procesador_pagos_addrs: Vec<String>,
+    estado: EstadoPersistenteSede,
+) -> Addr<Sede> {
+    let pending_reservas: std::collections::HashMap<String, (usize, BiciAlquilada)> = estado
+        .pending_reservas
+        .into_iter()
+        .map(|(alquiler_id, slot_idx, bici)| (alquiler_id, (slot_idx, bici)))
+        .collect();
+
     let sede = Sede {
         sede_id,
         coords,
         slots,
-        alquileres_activos: vec![],
-        devoluciones_recibidas: vec![],
         token_secret,
-        pending_reservas: std::collections::HashMap::new(),
+        pending_reservas,
         procesador_pagos_addrs,
         lider_cacheado: Arc::new(Mutex::new(None)),
         sedes_conocidas: vec![],
         sede_info,
+        estado_path: estado_path_de_id(sede_id),
+        alquileres_activos: estado.alquileres_activos,
+        devoluciones_recibidas: estado.devoluciones_recibidas,
+        pagos_pendientes: estado.pagos_pendientes,
+        notificaciones_pendientes: estado.notificaciones_pendientes,
     }
         .start();
     sede
@@ -1687,7 +2070,7 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
 }
 
 pub async fn enviar_notificacion( addr: String, info: NotificarDevolucion) -> Result<AckDevolucion, String> {
-    
+
     println!("[sede] Intentando notificar devolucion a {}", addr);
 
     let mut stream = TcpStream::connect(&addr)
