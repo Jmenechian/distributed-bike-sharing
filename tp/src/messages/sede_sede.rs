@@ -142,6 +142,7 @@ pub struct NotificacionPendiente {
     pub fin_ts: u64,
     pub monto: f64,
     pub pago_id: Option<String>,
+    pub token_alquiler: String,
     pub intentos: u8,
 }
 
