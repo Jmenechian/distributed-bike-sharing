@@ -46,7 +46,7 @@ levantar() {
 }
 
 enviar() {  # enviar <id> <comando>
-    echo "  > [$1] $2"
+    echo "  > [$1] $2" >&2   # a stderr: así no contamina las command substitutions
     echo "$2" > "${FIFO[$1]}"
     sleep 1.5
 }
@@ -79,20 +79,28 @@ assert_grep() {  # assert_grep <archivo> <regex> <descripcion>
     fi
 }
 
-assert_pending_no_vacio() {  # assert_pending_no_vacio <estado.json> <descripcion>
-    if python3 -c "import json,sys; sys.exit(0 if json.load(open('$1')).get('notificaciones_pendientes') else 1)" 2>/dev/null; then
-        echo "  PASS: $2"
+# Pide `info` a la sede y devuelve el último conteo de notificaciones pendientes que reporta.
+sede_pending_count() {  # sede_pending_count <id>
+    enviar "$1" "info"
+    grep "Notificaciones pendientes:" "${OUT[$1]}" | tail -1 | grep -oE '[0-9]+'
+}
+
+assert_pending_no_vacio() {  # assert_pending_no_vacio <id> <descripcion>
+    local n; n="$(sede_pending_count "$1")"
+    if [[ "${n:-0}" -gt 0 ]]; then
+        echo "  PASS: $2   (info: $n pendientes)"
     else
-        echo "  FAIL: $2   (notificaciones_pendientes vacío/ausente en $1)"
+        echo "  FAIL: $2   (info reporta ${n:-0} pendientes)"
         FALLOS=$((FALLOS + 1))
     fi
 }
 
-assert_pending_vacio() {  # assert_pending_vacio <estado.json> <descripcion>
-    if python3 -c "import json,sys; sys.exit(1 if json.load(open('$1')).get('notificaciones_pendientes') else 0)" 2>/dev/null; then
+assert_pending_vacio() {  # assert_pending_vacio <id> <descripcion>
+    local n; n="$(sede_pending_count "$1")"
+    if [[ "${n:-1}" -eq 0 ]]; then
         echo "  PASS: $2"
     else
-        echo "  FAIL: $2   (notificaciones_pendientes no vacío en $1)"
+        echo "  FAIL: $2   (info reporta ${n} pendientes)"
         FALLOS=$((FALLOS + 1))
     fi
 }
@@ -213,12 +221,12 @@ e5() {
     enviar cli "devolver_bici"
     esperar 2
     assert_grep "${OUT[sede2]}" "PENDIENTE" "sede2 (offline) dejó la notificación PENDIENTE"
-    assert_pending_no_vacio "$ROOT/estado_sede_2.json" "pendiente persistida en sede2"
+    assert_pending_no_vacio sede2 "sede2 reporta la notificación pendiente (via info)"
     assert_grep "${OUT[cli]}" "Dinero actual|Devolucion" "el cliente igual recibió la devolución"
     enviar sede2 "online"
     esperar 3
     assert_grep "${OUT[sede2]}" "tengo su bici" "sede2 hizo flush al volver online (avisó a sede1)"
-    assert_pending_vacio "$ROOT/estado_sede_2.json" "la cola de pendientes quedó vacía tras el flush"
+    assert_pending_vacio sede2 "la cola de pendientes quedó vacía tras el flush (via info)"
     teardown_cluster
 }
 

@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use matenmutex::common::calcular_distancia;
 use matenmutex::messages::sede_sede::SedeInfo;
+use std::io::Write;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -325,6 +326,7 @@ async fn main() {
             ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
             ["ver_comandos"] => Ok(listar_comandos()),
+            ["clear"] => Ok(limpiar_pantalla()),
             ["quit"] => break,
             _ => {
                 println!("Comando Invalido: '{}'", input);
@@ -351,8 +353,15 @@ fn listar_comandos() {
          {GREEN}  ver_dinero{RESET}                     - Ver el dinero actual\n\
          {GREEN}  pedir_sedes{RESET}                    - Pide Sede Cercanas\n\
          {GREEN}  ver_comandos{RESET}                  - Ver esta lista de comandos\n\
+         {GREEN}  clear{RESET}                          - Limpiar la pantalla\n\
          {GREEN}  quit{RESET}                           - Salir\n"
     );
+}
+
+/// Limpia la pantalla de la terminal (como el comando `clear`).
+fn limpiar_pantalla() {
+    print!("\x1b[2J\x1b[H");
+    let _ = io::stdout().flush();
 }
 
 #[cfg(test)]

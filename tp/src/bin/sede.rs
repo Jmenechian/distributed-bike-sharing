@@ -24,6 +24,7 @@ use std::io;
 use std::io::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
+use std::io::Write;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
 const CONFIG_FILE: usize = 1;
@@ -2176,8 +2177,9 @@ async fn loop_cli(sede: Addr<Sede>, sede_id: u32, offline: Arc<Mutex<bool>>, des
             }
             "info" => imprimir_info(&sede, &offline, sede_id).await,
             "ver_comandos" => listar_comandos_sede(sede_id),
+            "clear" => limpiar_pantalla(),
             "" => {}
-            otro => println!("Comando invalido: '{}' (online | offline | info | ver_comandos)", otro),
+            otro => println!("Comando invalido: '{}' (online | offline | info | ver_comandos | clear)", otro),
         }
     }
 }
@@ -2189,8 +2191,15 @@ fn listar_comandos_sede(sede_id: u32) {
          {GREEN}  online{RESET}            - Volver a estar en línea\n\
          {GREEN}  offline{RESET}           - Aislarse de las demás sedes\n\
          {GREEN}  info{RESET}              - Ver el estado de esta sede\n\
-         {GREEN}  ver_comandos{RESET}      - Ver esta lista de comandos\n"
+         {GREEN}  ver_comandos{RESET}      - Ver esta lista de comandos\n\
+         {GREEN}  clear{RESET}             - Limpiar la pantalla\n"
     );
+}
+
+/// Limpia la pantalla de la terminal (como el comando `clear`).
+fn limpiar_pantalla() {
+    print!("\x1b[2J\x1b[H");
+    let _ = io::stdout().flush();
 }
 
 /// Imprime un resumen del estado de la sede para la CLI.
