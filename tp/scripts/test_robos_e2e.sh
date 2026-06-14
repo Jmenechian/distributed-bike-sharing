@@ -136,11 +136,11 @@ e1() {
     levantar cliente cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
-    enviar cli "dinero"
+    enviar cli "ver_dinero"
     enviar cli "solicitar_bici"
     esperar 3
     enviar cli "devolver_bici"
-    enviar cli "dinero"
+    enviar cli "ver_dinero"
     esperar 2
     assert_grep "${OUT[cli]}" "DevolucionOk|Devolucion exitosa|Dinero actual" "el cliente devolvió la bici"
     assert_grep "$ROOT/logs/sede1.log" "Dep.sito .* reintegrado" "sede1 reintegró el depósito (\$150)"

@@ -224,3 +224,9 @@ pub struct GetDevolucionesRecibidas;
 impl Message for GetDevolucionesRecibidas {
     type Result = Vec<DevolucionRecibida>;
 }
+
+pub struct GetNotificacionesPendientes;
+
+impl Message for GetNotificacionesPendientes {
+    type Result = Vec<NotificacionPendiente>;
+}
