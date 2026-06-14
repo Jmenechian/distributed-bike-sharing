@@ -17,16 +17,23 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, RemoverAlquiler, VerificarRoboMasTarde};
+use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetNotificacionesPendientes, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, RemoverAlquiler, VerificarRoboMasTarde};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::slot::Cancelar;
 use std::io;
 use std::io::Error;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
+use std::io::Write;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
 const CONFIG_FILE: usize = 1;
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BOLD_CYAN: &str = "\x1b[1;36m";
 
 #[derive(Deserialize)]
 struct SedeConfig {
@@ -401,7 +408,7 @@ impl Sede {
             if vencida && sede.conectada {
                 sede.conectada = false;
                 log!("[sede {}]: la sede {} se considera CAIDA (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
-                println!("[sede {}]: la sede {} esta OFFLINE (sin heartbeat hace mas de {}s)", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
+                println!("{YELLOW}[sede {}]: la sede {} esta OFFLINE (sin heartbeat hace mas de {}s){RESET}", self.sede_id, sede.sede_id, LIVENESS_TIMEOUT);
             }
         }
     }
@@ -476,6 +483,14 @@ impl Handler<GetDevolucionesRecibidas> for Sede {
 
     fn handle(&mut self, _msg: GetDevolucionesRecibidas, _ctx: &mut Self::Context) -> Self::Result {
         MessageResult(self.devoluciones_recibidas.clone())
+    }
+}
+
+impl Handler<GetNotificacionesPendientes> for Sede {
+    type Result = MessageResult<GetNotificacionesPendientes>;
+
+    fn handle(&mut self, _msg: GetNotificacionesPendientes, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult(self.notificaciones_pendientes.clone())
     }
 }
 
@@ -1094,7 +1109,7 @@ impl Handler<Heartbeat> for Sede {
             Some(sede) => {
                 if !sede.conectada {
                     log!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
-                    println!("[sede {}]: la sede {} esta ONLINE de nuevo", self.sede_id, info.sede_id);
+                    println!("{GREEN}[sede {}]: la sede {} esta ONLINE de nuevo{RESET}", self.sede_id, info.sede_id);
                     ctx.address().do_send(FlushNotificacionesPendientes);
                 }
                 *sede = info;
@@ -2132,16 +2147,16 @@ async fn main() {
 
     let sede_sede_addr = format!("127.0.0.1:888{}", n);
     let sede_sede_listener = TcpListener::bind(&sede_sede_addr).await.unwrap();
-    tokio::spawn(loop_cli(sede.clone(), offline.clone(), despertar.clone()));
+    tokio::spawn(loop_cli(sede.clone(), sede_id, offline.clone(), despertar.clone()));
 
     tokio::spawn(loop_sedes(sede.clone(), sede_sede_listener, offline, despertar));
 
     loop_pub(sede, public_listener).await;
 }
 
-/// CLI de la sede: muta el estado online/offline. Al volver online despierta al loop publico.
-async fn loop_cli(sede: Addr<Sede>, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
-    println!("Comandos de la sede: online | offline");
+/// CLI de la sede: muestra el estado, cambia online/offline y lista la info de la sede.
+async fn loop_cli(sede: Addr<Sede>, sede_id: u32, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
+    listar_comandos_sede(sede_id);
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -2150,7 +2165,7 @@ async fn loop_cli(sede: Addr<Sede>, offline: Arc<Mutex<bool>>, despertar: Arc<No
         match line.trim() {
             "offline" => {
                 *offline.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                println!("[sede] offline");
+                println!("{YELLOW}[sede {sede_id}] ahora OFFLINE — aislada de las demás sedes{RESET}");
             }
             "online" => {
                 *offline.lock().unwrap_or_else(|e| e.into_inner()) = false;
@@ -2158,12 +2173,72 @@ async fn loop_cli(sede: Addr<Sede>, offline: Arc<Mutex<bool>>, despertar: Arc<No
                 // El flush no puede depender de dónde quedó parado loop_sedes (puede estar
                 // bloqueado en accept y perderse el notify), así que lo disparamos acá.
                 sede.do_send(FlushNotificacionesPendientes);
-                println!("[sede] online");
+                println!("{GREEN}[sede {sede_id}] ahora ONLINE{RESET}");
             }
+            "info" => imprimir_info(&sede, &offline, sede_id).await,
+            "ver_comandos" => listar_comandos_sede(sede_id),
+            "clear" => limpiar_pantalla(),
             "" => {}
-            otro => println!("Comando invalido: '{}' (online | offline)", otro),
+            otro => println!("Comando invalido: '{}' (online | offline | info | ver_comandos | clear)", otro),
         }
     }
+}
+
+fn listar_comandos_sede(sede_id: u32) {
+    println!(
+        "\n{BOLD_CYAN}=== Sede {sede_id} — CLI ==={RESET}\n\
+         {BOLD}Comandos disponibles:{RESET}\n\
+         {GREEN}  online{RESET}            - Volver a estar en línea\n\
+         {GREEN}  offline{RESET}           - Aislarse de las demás sedes\n\
+         {GREEN}  info{RESET}              - Ver el estado de esta sede\n\
+         {GREEN}  ver_comandos{RESET}      - Ver esta lista de comandos\n\
+         {GREEN}  clear{RESET}             - Limpiar la pantalla\n"
+    );
+}
+
+/// Limpia la pantalla de la terminal (como el comando `clear`).
+fn limpiar_pantalla() {
+    print!("\x1b[2J\x1b[H");
+    let _ = io::stdout().flush();
+}
+
+/// Imprime un resumen del estado de la sede para la CLI.
+async fn imprimir_info(sede: &Addr<Sede>, offline: &Arc<Mutex<bool>>, sede_id: u32) {
+    let offline_ahora = *offline.lock().unwrap_or_else(|e| e.into_inner());
+    let estado = if offline_ahora {
+        format!("{YELLOW}OFFLINE{RESET}")
+    } else {
+        format!("{GREEN}ONLINE{RESET}")
+    };
+
+    let info = sede.send(GetInfo).await;
+    let sedes = sede.send(GetSedesConocidas).await.unwrap_or_default();
+    let alquileres = sede.send(GetAlquileresActivos).await.unwrap_or_default();
+    let devoluciones = sede.send(GetDevolucionesRecibidas).await.unwrap_or_default();
+    let pendientes = sede.send(GetNotificacionesPendientes).await.unwrap_or_default();
+
+    println!("\n{BOLD_CYAN}=== Info Sede {sede_id} ==={RESET}");
+    println!("  Estado:                 {estado}");
+    if let Ok(info) = info {
+        println!("  Coordenadas:            ({:.4}, {:.4})", info.coords.0, info.coords.1);
+        println!("  Slots:                  {} disponibles | {} vacíos", info.slots_disponibles, info.slots_vacios);
+    }
+
+    let robos = alquileres.iter().filter(|a| matches!(a.estado, EstadoAlquiler::RoboConfirmado)).count();
+    println!("  Alquileres activos:     {} (robos confirmados: {})", alquileres.len(), robos);
+    println!("  Devoluciones recibidas: {}", devoluciones.len());
+
+    println!("  Notificaciones pendientes: {}", pendientes.len());
+    for p in &pendientes {
+        println!("    - alquiler {} → sede {}", p.alquiler_id, p.sede_origen_id);
+    }
+
+    println!("  Otras sedes conocidas:  {}", sedes.len());
+    for s in &sedes {
+        let est = if s.conectada { "online " } else { "offline" };
+        println!("    - sede {} | {} | ({:.4}, {:.4}) | slots disp {}", s.sede_id, est, s.coords.0, s.coords.1, s.slots_disponibles);
+    }
+    println!();
 }
 
 async fn loop_sedes(sede: Addr<Sede>, listener: TcpListener, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
@@ -2171,9 +2246,9 @@ async fn loop_sedes(sede: Addr<Sede>, listener: TcpListener, offline: Arc<Mutex<
         // Offline: Nos dormimos hasta que la CLI vuelva online
         // y dispare notify_waiters. loop_pub sigue aparte, asi que se atienden clientes locales.
         if *offline.lock().unwrap_or_else(|e| e.into_inner()) {
-            println!("[sede] offline — aislada de otras sedes, esperando online");
+            log!("[sede] offline — aislada de otras sedes, esperando online");
             despertar.notified().await;
-            println!("[sede] online — reanudando comunicacion entre sedes");
+            log!("[sede] online — reanudando comunicacion entre sedes");
             sede.do_send(FlushNotificacionesPendientes);
         }
 

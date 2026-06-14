@@ -16,8 +16,15 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::interval;
 use uuid::Uuid;
 use matenmutex::utils::tiempos::{TiemposBuilder, Tiempos};
+use std::io::Write;
+
 const CONFIG_FILE: usize = 1;
 const MINIMAL_LENGTH: usize = 2;
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const BOLD_CYAN: &str = "\x1b[1;36m";
 
 const PUERTO_BASE: u16 = 6000;
 const PUERTO_BASE_2PC: u16 = PUERTO_BASE + 1000;
@@ -252,7 +259,62 @@ impl ProcesadorPagos {
         tokio::spawn(self.clone().monitor_loop());
         tokio::spawn(self.clone().accept_loop_sedes());
         tokio::spawn(self.clone().accept_loop_2pc());
+        tokio::spawn(self.clone().cli_loop());
         self.recv_loop().await
+    }
+
+    /// CLI del procesador: muestra el estado del nodo y la lista de comandos.
+    async fn cli_loop(self: Arc<Self>) {
+        listar_comandos_procesador(self.procesador_id);
+        let stdin = tokio::io::stdin();
+        let mut lines = TokioBufReader::new(stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            match line.trim() {
+                "info" => self.imprimir_info(),
+                "ver_comandos" => listar_comandos_procesador(self.procesador_id),
+                "clear" => limpiar_pantalla(),
+                "" => {}
+                otro => println!("Comando invalido: '{}' (info | ver_comandos | clear)", otro),
+            }
+        }
+    }
+
+    /// Imprime un resumen del estado de este procesador para la CLI.
+    fn imprimir_info(&self) {
+        let (rol, lider) = match self.rol() {
+            Some(RolActual::Lider) => ("LIDER".to_string(), None),
+            Some(RolActual::Replica { lider_id }) => ("REPLICA".to_string(), Some(lider_id)),
+            Some(RolActual::Candidato) => ("CANDIDATO".to_string(), None),
+            None => ("DESCONOCIDO".to_string(), None),
+        };
+        let vivos: Vec<u32> = self.peers_vivos().iter().map(id_de_addr).collect();
+        let todos: Vec<u32> = self.peers.iter().map(id_de_addr).collect();
+        let addr_pub = self.public_listener.local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".to_string());
+
+        let (total, pre, cobros, reembolsos) = {
+            let pagos = self.pagos_procesados.lock().unwrap_or_else(|e| e.into_inner());
+            let cuenta = |t: TipoOperacionPago| pagos.iter().filter(|p| p.tipo == t).count();
+            (
+                pagos.len(),
+                cuenta(TipoOperacionPago::PreAutorizacion),
+                cuenta(TipoOperacionPago::CobroFinal),
+                cuenta(TipoOperacionPago::ReembolsoPenalizacion),
+            )
+        };
+        let en_curso = self.transacciones_en_curso.lock().unwrap_or_else(|e| e.into_inner()).len();
+
+        println!("\n{BOLD_CYAN}=== Info ProcesadorPagos {} ==={RESET}", self.procesador_id);
+        println!("  Rol:                {rol}");
+        if let Some(lider_id) = lider {
+            println!("  Líder:              {lider_id}");
+        }
+        println!("  Dirección pública:  {addr_pub}");
+        println!("  Peers vivos:        {vivos:?} de {todos:?}");
+        println!("  Pagos procesados:   {total} (preautorizaciones: {pre}, cobros: {cobros}, reembolsos: {reembolsos})");
+        println!("  Transacciones 2PC en curso: {en_curso}");
+        println!();
     }
 
     async fn accept_loop_sedes(self: Arc<Self>) {
@@ -1175,6 +1237,22 @@ fn aplicar_evento_2pc(tx: &mut TransaccionPago2PC, evento: EventoVoto2PC) {
             tx.estado = decidir_estado_2pc(tx, true);
         }
     }
+}
+
+fn listar_comandos_procesador(procesador_id: u32) {
+    println!(
+        "\n{BOLD_CYAN}=== ProcesadorPagos {procesador_id} — CLI ==={RESET}\n\
+         {BOLD}Comandos disponibles:{RESET}\n\
+         {GREEN}  info{RESET}          - Ver el estado de este procesador\n\
+         {GREEN}  ver_comandos{RESET}  - Ver esta lista de comandos\n\
+         {GREEN}  clear{RESET}         - Limpiar la pantalla\n"
+    );
+}
+
+/// Limpia la pantalla de la terminal (como el comando `clear`).
+fn limpiar_pantalla() {
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
 }
 
 #[tokio::main]

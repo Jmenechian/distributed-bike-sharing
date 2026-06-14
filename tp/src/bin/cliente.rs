@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use matenmutex::common::calcular_distancia;
 use matenmutex::messages::sede_sede::SedeInfo;
+use std::io::Write;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -161,14 +162,12 @@ impl Cliente {
 
     async fn enviar_solicitar_bici(cliente_id: u32, coords: (f64, f64), dinero: f64, writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
         let msg = MsgClienteASede::SolicitarBici(SolicitarBici { cliente_id, coords, dinero});
-        println!("[cliente] Envia SolicitarBici");
         let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
         Ok(respuesta)
     }
 
     async fn enviar_info_sedes_cercanas(coords: (f64, f64), writer: &mut OwnedWriteHalf, reader: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<String>, io::Error> {
         let msg = MsgClienteASede::PedirSedes(PedirSedes {coords});
-        println!("[cliente] Envia Pedir Sedes");
         let respuesta = enviar_mensaje_a_sede(writer, reader, msg).await?;
         Ok(respuesta)
     }
@@ -177,7 +176,6 @@ impl Cliente {
         let alquiler_id = bici.alquiler_id().to_string();
         let (writer, reader) = self.validar_conexion()?;
         let ack = MsgClienteASede::AckComprobanteAlquiler(AckComprobanteAlquiler { alquiler_id: alquiler_id.clone() });
-        println!("[cliente] Envia AckComprobanteAlquiler (alquiler {})", alquiler_id);
         let respuesta = enviar_mensaje_a_sede(writer, reader, ack).await?;
         Ok(respuesta)
     }
@@ -192,7 +190,7 @@ impl Cliente {
                     self.bici_activa = Some(bici_confirmada);
                 }
                 Ok(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
-                    println!("[cliente] Recibe AlquilerRechazado (motivo {})", motivo);
+                    println!("Alquiler rechazado: {}", motivo);
                 }
                 _ => println!("Sede: {}", respuesta),
             }
@@ -202,11 +200,9 @@ impl Cliente {
     fn descifrar_respuesta_de_solicitar_bici(respuesta: Option<String>) -> Result<(BiciAlquilada, f64), io::Error> {
         match respuesta.as_deref().and_then(|l| serde_json::from_str::<RespuestaSolicitarBici>(l).ok()) {
             Some(RespuestaSolicitarBici::ComprobanteAlquilerEmitido(bici, dinero)) => {
-                println!("[cliente] Recibe ComprobanteAlquilerEmitido (bici {}, alquiler {})", bici.bici_id(), bici.alquiler_id());
                 Ok((bici,dinero))
             }
             Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
-                println!("[cliente] Recibe AlquilerRechazado (motivo {})", motivo);
                 Err(io::Error::new(io::ErrorKind::Other, format!("Alquiler rechazado: {motivo}")))
             }
             _ => { Err(io::Error::new(io::ErrorKind::Other, "Respuesta inesperada de la sede")) }
@@ -260,7 +256,7 @@ impl Cliente {
                 self.bici_activa = None;
             }
             RespuestaDevolverBici::DevolucionRechazada(motivo) => {
-                println!("[cliente] Recibe DevolucionRechazada (motivo {})", motivo);
+                println!("Devolucion rechazada: {}", motivo);
             }
         }
     }
@@ -326,9 +322,11 @@ async fn main() {
             ["devolver_bici"] => cliente.devolver_bici().await,
             ["info_bicis"] => cliente.info_bicis().await,
             ["bici"] => Ok(cliente.mostrar_bici()),
-            ["dinero"] => Ok(cliente.mostrar_dinero()),
+            ["ver_dinero"] => Ok(cliente.mostrar_dinero()),
             ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
+            ["ver_comandos"] => Ok(listar_comandos()),
+            ["clear"] => Ok(limpiar_pantalla()),
             ["quit"] => break,
             _ => {
                 println!("Comando Invalido: '{}'", input);
@@ -352,9 +350,18 @@ fn listar_comandos() {
          {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
          {GREEN}  info_bicis{RESET}                     - Ver bicis disponibles\n\
          {GREEN}  recarga <n>{RESET}                    - Recargar dinero\n\
+         {GREEN}  ver_dinero{RESET}                     - Ver el dinero actual\n\
          {GREEN}  pedir_sedes{RESET}                    - Pide Sede Cercanas\n\
+         {GREEN}  ver_comandos{RESET}                  - Ver esta lista de comandos\n\
+         {GREEN}  clear{RESET}                          - Limpiar la pantalla\n\
          {GREEN}  quit{RESET}                           - Salir\n"
     );
+}
+
+/// Limpia la pantalla de la terminal (como el comando `clear`).
+fn limpiar_pantalla() {
+    print!("\x1b[2J\x1b[H");
+    let _ = io::stdout().flush();
 }
 
 #[cfg(test)]
