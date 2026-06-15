@@ -2,7 +2,7 @@ use actix::{Actor, Context};
 use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
 use std::io;
@@ -28,6 +28,14 @@ struct ClienteConfig {
     dinero: f64,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct EstadoPersistenteCliente {
+    coords: (f64, f64),
+    bici_activa: Option<BiciAlquilada>,
+    dinero: f64,
+    sedes_conocidas: Vec<SedeInfo>,
+}
+
 pub struct Cliente {
     cliente_id: u32,
     coords: (f64, f64),
@@ -36,6 +44,33 @@ pub struct Cliente {
     bici_activa: Option<BiciAlquilada>,
     dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
+}
+
+fn estado_path_de_id(cliente_id: u32) -> String {
+    format!("estado_cliente_{}.json", cliente_id)
+}
+
+fn cargar_estado_cliente(path: &str) -> Option<EstadoPersistenteCliente> {
+    let file = File::open(path).ok()?;
+    serde_json::from_reader(StdBufReader::new(file)).ok()
+}
+
+fn escribir_snapshot_a(estado_path: &str, snapshot: &EstadoPersistenteCliente) {
+    if estado_path.is_empty() {
+        return;
+    }
+
+    let json = match serde_json::to_vec_pretty(snapshot) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[persistencia] no se pudo serializar el estado: {e}");
+            return;
+        }
+    };
+    let tmp = format!("{}.tmp", estado_path);
+    if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, estado_path)) {
+        println!("[persistencia] no se pudo escribir {}: {e}", estado_path);
+    }
 }
 
 impl Actor for Cliente {
@@ -65,6 +100,8 @@ impl Cliente {
         let x = str_x.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada x invalida: '{str_x}' debe representar un número.")))?;
         let y = str_y.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada y invalida: '{str_y}' debe representar un número.")))?;
         self.coords = (x, y);
+        self.persistir_estado();
+        
         Ok(())
     }
 
@@ -89,6 +126,7 @@ impl Cliente {
         self.dinero += monto;
 
         println!("[cliente] Recarga de ${:.2}. Dinero actual: ${:.2}", monto, self.dinero);
+        self.persistir_estado();
 
         Ok(())
     }
@@ -137,6 +175,7 @@ impl Cliente {
         }
 
         Cliente::print_sedes(&self.sedes_conocidas, coords);
+        self.persistir_estado();
         Ok(())
     }
 
@@ -156,6 +195,7 @@ impl Cliente {
 
         let respuesta = self.enviar_ack_comprobante(bici).await?;
         self.descifrar_respuesta_de_ack_comprobante(respuesta, dinero);
+        self.persistir_estado();
 
         Ok(())
     }
@@ -230,6 +270,7 @@ impl Cliente {
             }
         }
 
+        self.persistir_estado();
         Ok(())
     }
 
@@ -272,6 +313,17 @@ impl Cliente {
             )),
         }
     }
+
+    fn persistir_estado(&self) {
+        let path = estado_path_de_id(self.cliente_id);
+        let snapshot = EstadoPersistenteCliente {
+            coords: self.coords,
+            bici_activa: self.bici_activa.clone(),
+            dinero: self.dinero,
+            sedes_conocidas: self.sedes_conocidas.clone(),
+        };
+        escribir_snapshot_a(&path, &snapshot);
+    }
 }
 
 
@@ -305,6 +357,16 @@ async fn main() {
             return;
         }
     };
+
+    let estado_path = estado_path_de_id(cliente.cliente_id);
+    if let Some(estado) = cargar_estado_cliente(&estado_path) {
+        cliente.coords = estado.coords;
+        if let Some(bici) = estado.bici_activa {
+            cliente.bici_activa = Some(bici);
+        }
+        cliente.dinero = estado.dinero;
+        cliente.sedes_conocidas = estado.sedes_conocidas;
+    }
 
     listar_comandos();
 
