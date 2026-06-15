@@ -60,11 +60,17 @@ impl Handler<Heartbeat> for Sede {
                 if !sede.conectada {
                     log!("[sede {}]: la sede {} volvio a estar VIVA", self.sede_id, info.sede_id);
                     println!("{}[sede {}]: la sede {} esta ONLINE de nuevo{}", crate::GREEN, self.sede_id, info.sede_id, crate::RESET);
-                    ctx.address().do_send(FlushNotificacionesPendientes);
                 }
                 *sede = info;
             }
             None => self.sedes_conocidas.push(info),
+        }
+
+        // Cada heartbeat es una oportunidad de reintentar las notificaciones encoladas: el
+        // origen pudo volver online sin que lo hayamos marcado caido antes (p. ej. cuando la
+        // que estuvo offline fue la sede destino, no la origen).
+        if !self.notificaciones_pendientes.is_empty() {
+            ctx.address().do_send(FlushNotificacionesPendientes);
         }
     }
 }
@@ -116,12 +122,18 @@ pub(crate) async fn loop_sedes(sede: Addr<Sede>, listener: TcpListener, offline:
         let (socket, _) = listener.accept().await.unwrap();
 
         let sede = sede.clone();
+        let offline = offline.clone();
 
         tokio::spawn(async move {
             let (reader, mut writer) = socket.into_split();
             let mut lines = BufReader::new(reader).lines();
 
             while let Ok(Some(line)) = lines.next_line().await {
+                // Offline: aislada de las demas sedes. Cerramos sin responder para que el
+                // emisor mantenga la notificacion pendiente hasta que volvamos online.
+                if *offline.lock().unwrap_or_else(|e| e.into_inner()) {
+                    break;
+                }
 
                 let response = match serde_json::from_str::<MsgSedeASede>(&line) {
                     Ok(MsgSedeASede::NotificarDevolucion(msg)) => {

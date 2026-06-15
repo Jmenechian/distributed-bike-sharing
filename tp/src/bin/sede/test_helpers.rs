@@ -125,6 +125,7 @@ pub(crate) fn sede_con_estados_path_y_procesador(estados: Vec<EstadoSlot>, proce
         notificaciones_pendientes: Vec::new(),
         offline: Arc::new(Mutex::new(false)),
         estaba_offline: false,
+        flush_en_curso: false,
     }
         .start()
 }
@@ -150,6 +151,7 @@ pub(crate) fn sede_offline_con_estados_y_procesador(estados: Vec<EstadoSlot>, pr
         notificaciones_pendientes: Vec::new(),
         offline: Arc::new(Mutex::new(true)),
         estaba_offline: false,
+        flush_en_curso: false,
     }
         .start()
 }

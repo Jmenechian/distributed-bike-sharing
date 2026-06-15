@@ -5,8 +5,8 @@
 # Corre los binarios reales (procesador_pagos + 2 sedes + cliente), maneja sus CLIs por
 # stdin via FIFOs, y valida por stdout / logs/sede{n}.log / estado_sede_{n}.json.
 #
-# Uso:   scripts/test_robos_e2e.sh [e1 e2 e3 e4 e5 e6 | all]
-# Tiempos: E2-E4 esperan >60s (ventana de robo), E6 ~20s extra (liveness). Total ~5 min.
+# Uso:   scripts/test_robos_e2e.sh [e1 e2 e3 e4 e5 e6 e7 e8 | all]
+# Tiempos: E2-E4 esperan >60s (ventana de robo), E6/E7 ~30s extra (liveness). Total ~6 min.
 #
 # OJO: bindea puertos fijos (6001, 7001/2, 8081/2, 8881/2, 9091). No correr junto a un
 # cluster manual ni a los otros scripts/tests.
@@ -63,7 +63,7 @@ matar_todos() {
 trap matar_todos EXIT
 
 limpiar_estado() {
-    rm -f "$ROOT"/estado_sede_*.json "$ROOT"/estado_procesador_*.json
+    rm -f "$ROOT"/estado_sede_*.json "$ROOT"/estado_procesador_*.json "$ROOT"/estado_cliente_*.json
 }
 
 esperar() { echo "  ... esperando ${1}s ${2:-}"; sleep "$1"; }
@@ -114,6 +114,16 @@ assert_no_grep() {  # assert_no_grep <archivo> <regex> <descripcion>
     fi
 }
 
+assert_grep_una_vez() {  # assert_grep_una_vez <archivo> <regex> <descripcion>
+    local n; n="$(grep -cE "$2" "$1" 2>/dev/null)"
+    if [[ "${n:-0}" -eq 1 ]]; then
+        echo "  PASS: $3"
+    else
+        echo "  FAIL: $3   (aparece ${n:-0} veces /$2/ en $1, se esperaba 1)"
+        FALLOS=$((FALLOS + 1))
+    fi
+}
+
 # ---------- setup de cluster ----------
 
 setup_cluster() {  # setup_cluster <con_sede2: 0|1>
@@ -143,6 +153,7 @@ e1() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "ver_dinero"
     enviar cli "solicitar_bici"
@@ -161,6 +172,7 @@ e2() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
     esperar "$ROBO_WAIT" "(ventana de robo > 60s)"
@@ -176,10 +188,12 @@ e3() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
     esperar "$ROBO_WAIT" "(ventana de robo > 60s)"
     assert_grep "${OUT[sede1]}" "Bici robada" "sede1 marcó robo antes de la devolución tardía"
+    enviar cli "mover 80.6090 100.3920"
     enviar cli "conectar_sede 2"
     enviar cli "recarga 2000"   # cubrir el costo por tiempo (65s * TASA)
     enviar cli "devolver_bici"
@@ -194,6 +208,7 @@ e4() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
     esperar "$ROBO_WAIT" "(ventana de robo > 60s)"
@@ -212,9 +227,11 @@ e5() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
     esperar 2
+    enviar cli "mover 80.6090 100.3920"
     enviar sede2 "offline"
     esperar 1
     enviar cli "conectar_sede 2"
@@ -226,6 +243,7 @@ e5() {
     enviar sede2 "online"
     esperar 3
     assert_grep "${OUT[sede2]}" "tengo su bici" "sede2 hizo flush al volver online (avisó a sede1)"
+    assert_grep_una_vez "${OUT[sede2]}" "tengo su bici" "sede2 avisó UNA sola vez (sin reenvíos por heartbeats sucesivos)"
     assert_pending_vacio sede2 "la cola de pendientes quedó vacía tras el flush (via info)"
     teardown_cluster
 }
@@ -235,11 +253,13 @@ e6() {
     setup_cluster 1
     levantar cliente cliente/cliente.json cli
     esperar 1
+    enviar cli "mover 30.6037 40.3816"
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
     esperar 2
     matar sede1
     esperar 20 "(que sede2 marque a sede1 CAIDA, liveness 15s)"
+    enviar cli "mover 80.6090 100.3920"
     enviar cli "conectar_sede 2"
     enviar cli "devolver_bici"
     esperar 2
@@ -250,11 +270,83 @@ e6() {
     teardown_cluster
 }
 
+e7() {
+    echo "== E7 (borde): bici sacada de origen OFFLINE y devuelta en destino OFFLINE; destino revive primero =="
+    setup_cluster 1
+    levantar cliente cliente/cliente.json cli
+    esperar 1
+
+    # Saco la bici de sede1 estando OFFLINE (cliente movido al rango de sede1)
+    enviar cli "mover 30.6037 40.3816"
+    enviar sede1 "offline"
+    esperar 1
+    enviar cli "conectar_sede 1"
+    enviar cli "solicitar_bici"
+    esperar 2
+
+    # Devuelvo en sede2 tambien OFFLINE (cliente movido al rango de sede2)
+    enviar cli "mover 80.6090 100.3920"
+    enviar sede2 "offline"
+    esperar 1
+    enviar cli "conectar_sede 2"
+    enviar cli "recarga 2000"
+    enviar cli "devolver_bici"
+    esperar 2
+    assert_grep "${OUT[sede2]}" "PENDIENTE" "sede2 encoló (ambas sedes offline en la devolución)"
+    assert_grep "${OUT[cli]}" "Devolucion exitosa|Dinero actual" "el cliente igual recibió la devolución"
+
+    # Destino vuelve online pero el origen sigue caído: NO debe entregarse todavía.
+    enviar sede2 "online"
+    esperar 20 "(sede2 online; marca a sede1 CAIDA por liveness, origen sigue offline)"
+    assert_no_grep "${OUT[sede2]}" "tengo su bici" "sede2 NO avisó: el origen sigue offline"
+    assert_pending_no_vacio sede2 "sede2 mantiene la pendiente esperando a que reviva el origen"
+
+    # Recién cuando revive el origen, el flush por heartbeat la entrega.
+    enviar sede1 "online"
+    esperar 10 "(heartbeats: sede2 detecta a sede1 ONLINE de nuevo)"
+    assert_grep "${OUT[sede2]}" "tengo su bici" "sede2 hizo flush al revivir sede1"
+    assert_grep_una_vez "${OUT[sede2]}" "tengo su bici" "sede2 avisó UNA sola vez (sin reenvíos por heartbeats sucesivos)"
+    assert_pending_vacio sede2 "la cola de pendientes quedó vacía tras avisar al origen"
+    teardown_cluster
+}
+
+e8() {
+    echo "== E8 (borde): entrega por HEARTBEAT cuando el origen vuelve sin haber sido marcado caído =="
+    setup_cluster 1
+    levantar cliente cliente/cliente.json cli
+    esperar 1
+
+    # Saco la bici de sede1 ONLINE (origen = sede1)
+    enviar cli "mover 30.6037 40.3816"
+    enviar cli "conectar_sede 1"
+    enviar cli "solicitar_bici"
+    esperar 2
+
+    # Devuelvo en sede2 (que NUNCA se va offline) con el origen recién caído: como sede2
+    # todavía ve a sede1 online (stale, < liveness), el aviso falla y queda pendiente.
+    enviar sede1 "offline"
+    enviar cli "mover 80.6090 100.3920"
+    enviar cli "conectar_sede 2"
+    enviar cli "recarga 2000"
+    enviar cli "devolver_bici"
+    esperar 2
+    assert_grep "${OUT[sede2]}" "PENDIENTE" "sede2 encoló (origen no responde, pero no lo marcó caído)"
+
+    # El origen vuelve antes de los 15s de liveness: sede2 nunca lo marcó caído, así que
+    # no hay transición caída->viva. La entrega tiene que salir igual por el heartbeat.
+    enviar sede1 "online"
+    esperar 8 "(heartbeat de sede1; sede2 reintenta la pendiente sin transición de liveness)"
+    assert_grep "${OUT[sede2]}" "tengo su bici" "sede2 entregó por heartbeat (sin marcar caído al origen)"
+    assert_grep_una_vez "${OUT[sede2]}" "tengo su bici" "sede2 avisó UNA sola vez (sin reenvíos por heartbeats sucesivos)"
+    assert_pending_vacio sede2 "la cola de pendientes quedó vacía tras el reintento por heartbeat"
+    teardown_cluster
+}
+
 # ============================================================
 
 requiere_binarios
 ESCENARIOS=("${@:-all}")
-[[ "${ESCENARIOS[*]}" == "all" ]] && ESCENARIOS=(e1 e2 e3 e4 e5 e6)
+[[ "${ESCENARIOS[*]}" == "all" ]] && ESCENARIOS=(e1 e2 e3 e4 e5 e6 e7 e8)
 
 for esc in "${ESCENARIOS[@]}"; do
     echo

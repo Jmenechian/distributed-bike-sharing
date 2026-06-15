@@ -1,0 +1,11 @@
+{
+  "cliente_id": 28,
+  "coord_x": 50,
+  "coord_y": 50,
+  "dinero": 10000.0,
+  "sedes": [
+    {"sede_id": 1, "coord_x": 30.6037, "coord_y": 40.3816},
+    {"sede_id": 2, "coord_x": 80.6090, "coord_y": 100.3920},
+    {"sede_id": 3, "coord_x": -34.6150, "coord_y": -58.4000}
+  ]
+}

@@ -68,6 +68,7 @@ pub(crate) struct Sede {
     pub(crate) notificaciones_pendientes: Vec<NotificacionPendiente>,
     pub(crate) offline: Arc<Mutex<bool>>,
     pub(crate) estaba_offline: bool,
+    pub(crate) flush_en_curso: bool,
 }
 
 impl Actor for Sede {
@@ -418,6 +419,7 @@ fn crear_sede(
         notificaciones_pendientes: estado.notificaciones_pendientes,
         offline,
         estaba_offline: false,
+        flush_en_curso: false,
     }
         .start();
     sede

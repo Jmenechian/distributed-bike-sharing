@@ -433,13 +433,24 @@ impl Handler<FlushNotificacionesPendientes> for Sede {
     type Result = ResponseFuture<()>;
 
     fn handle(&mut self, _msg: FlushNotificacionesPendientes, ctx: &mut Self::Context) -> Self::Result {
+        // Un solo flush en vuelo, sino los heartbeats mandan mucho mensajes innecesarios.
+        if self.flush_en_curso {
+            return Box::pin(async {});
+        }
+        self.flush_en_curso = true;
+
         let pendientes = self.notificaciones_pendientes.clone();
         let sede_addr = ctx.address();
         let sede_id = self.sede_id;
-
+        let conocidas = self.sedes_conocidas.to_vec();
         Box::pin(async move {
             for pendiente in pendientes {
                 let notificacion = notificacion_pendiente_a_devolucion(&pendiente);
+                // Solo avisamos a la sede origen si esta online, si sigue caida la dejamos
+                // pendiente y reintentamos cuando su heartbeat la marque viva de nuevo.
+                if !origen_esta_online(pendiente.sede_origen_id, &conocidas) {
+                    continue;
+                }
                 let addr = format!("127.0.0.1:888{}", pendiente.sede_origen_id);
                 match enviar_notificacion(addr, notificacion).await {
                     Ok(ack) => {
@@ -451,8 +462,34 @@ impl Handler<FlushNotificacionesPendientes> for Sede {
                     Err(_) => {}
                 }
             }
+            // Se encola despues de los Remover, asi al limpiar la bandera la lista ya refleja
+            // lo entregado y el proximo heartbeat solo reintenta lo que realmente quedo.
+            sede_addr.do_send(FlushTerminado);
         })
     }
+}
+
+struct FlushTerminado;
+
+impl Message for FlushTerminado {
+    type Result = ();
+}
+
+impl Handler<FlushTerminado> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, _msg: FlushTerminado, _ctx: &mut Self::Context) {
+        self.flush_en_curso = false;
+    }
+}
+
+fn origen_esta_online(sede_origen_id: u32, sedes_conocidas: &Vec<SedeInfo>) -> bool {
+    for sede in sedes_conocidas {
+        if sede.sede_id == sede_origen_id {
+            return sede.conectada;
+        }
+    }
+    false
 }
 
 impl Handler<GuardarDevolucion> for Sede {
