@@ -1,30 +1,30 @@
 use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
-use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, OFFLINE, ONLINE, PREMONTO, TASA};
 use matenmutex::log;
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
+use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
+use matenmutex::messages::sede_sede::{AckDevolucion, ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetNotificacionesPendientes, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeASede, MsgSedeHeartbeat, NotificacionPendiente, NotificarDevolucion, RemoverAlquiler, SedeInfo, VerificarRoboMasTarde};
 use matenmutex::slot;
+use matenmutex::slot::Cancelar;
 use matenmutex::slot::{ActualizarSlots, AsegurarBici, Confirmar, ConsultarBici, EstadoSlot, EstadoSlotPersistido, ExportarEstado, Reservar, ResultadoReserva, SetSlotCounts, Slot};
 use matenmutex::token::{self, PayloadToken, SECRET_LEN};
 use matenmutex::types::{timestamp_actual, Bici, BiciAlquilada, PagoPendiente};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
+use std::io;
 use std::io::BufReader as StdBufReader;
+use std::io::Error;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::time::sleep;
-use tokio::sync::Notify;
-use uuid::Uuid;
-use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
-use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, PREMONTO, PUERTO_BASE, TASA};
-use matenmutex::messages::sede_sede::{ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetNotificacionesPendientes, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeHeartbeat, SedeInfo, NotificarDevolucion, NotificacionPendiente, AckDevolucion, MsgSedeASede, RemoverAlquiler, VerificarRoboMasTarde};
-use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
-use matenmutex::slot::Cancelar;
-use std::io;
-use std::io::Error;
-use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
-use std::io::Write;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::Notify;
+use tokio::time::sleep;
+use uuid::Uuid;
 
 const PROCESADOR_PAGOS_ADDR_DEFAULT: &str = "127.0.0.1:9091";
 const CONFIG_FILE: usize = 1;
@@ -642,13 +642,10 @@ impl Handler<PedirSedes> for Sede {
     fn handle(&mut self, msg: PedirSedes, _ctx: &mut Self::Context) -> Self::Result {
         let sedes_cercanas: Vec<SedeInfo> = self.sedes_conocidas
             .iter()
-            .filter(|s| calcular_distancia(s.coords, msg.coords) <= DISTANCIA_MINIMA)
             .cloned()
             .collect();
         let mut resultado = sedes_cercanas;
-        if calcular_distancia(self.sede_info.coords, msg.coords) <= DISTANCIA_MINIMA {
-            resultado.push(self.sede_info.clone());
-        }
+        resultado.push(self.sede_info.clone());
          MessageResult(resultado)
     }
 }
@@ -1121,8 +1118,8 @@ impl Handler<Heartbeat> for Sede {
 
 #[cfg(test)]
 mod tests {
-    use matenmutex::common::MAX_VALUE;
     use super::*;
+    use matenmutex::common::MAX_VALUE;
     use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, SolicitarBici};
     use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
     use matenmutex::messages::sede_sede::crear_info_dummy;
@@ -2154,6 +2151,21 @@ async fn main() {
     loop_pub(sede, public_listener).await;
 }
 
+struct ActualizarEstado {
+    estado: bool
+}
+
+impl Message for ActualizarEstado {
+    type Result = ();
+}
+
+impl Handler<ActualizarEstado> for Sede {
+    type Result = ();
+
+    fn handle(&mut self, msg: ActualizarEstado, _: &mut Self::Context) -> Self::Result {
+        self.sede_info.conectada = msg.estado;
+    }
+}
 /// CLI de la sede: muestra el estado, cambia online/offline y lista la info de la sede.
 async fn loop_cli(sede: Addr<Sede>, sede_id: u32, offline: Arc<Mutex<bool>>, despertar: Arc<Notify>) {
     listar_comandos_sede(sede_id);
@@ -2165,10 +2177,12 @@ async fn loop_cli(sede: Addr<Sede>, sede_id: u32, offline: Arc<Mutex<bool>>, des
         match line.trim() {
             "offline" => {
                 *offline.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                sede.send(ActualizarEstado { estado: OFFLINE }).await;
                 println!("{YELLOW}[sede {sede_id}] ahora OFFLINE — aislada de las demás sedes{RESET}");
             }
             "online" => {
                 *offline.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                sede.send(ActualizarEstado { estado: ONLINE }).await;
                 despertar.notify_waiters(); // despierta a loop_sedes y al receiver, ambos esperando
                 // El flush no puede depender de dónde quedó parado loop_sedes (puede estar
                 // bloqueado en accept y perderse el notify), así que lo disparamos acá.
