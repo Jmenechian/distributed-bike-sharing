@@ -33,7 +33,23 @@ pub struct PedirSedes {
 pub struct PreguntarBicis; // No esta en el readme
 
 #[derive(Serialize, Deserialize)]
+pub struct Handshake {
+    pub coords: (f64, f64),
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+pub enum RespuestaHandshake {
+    Aceptado((f64, f64)),
+    Rechazado(String),
+}
+
+impl Message for Handshake {
+    type Result = RespuestaHandshake;
+}
+
+#[derive(Serialize, Deserialize)]
 pub enum MsgClienteASede {
+    Handshake(Handshake),
     SolicitarBici(SolicitarBici),
     AckComprobanteAlquiler(AckComprobanteAlquiler),
     DevolverBici(DevolverBici),

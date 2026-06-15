@@ -21,7 +21,7 @@ pub enum MsgSedeASede {
     NotificarDevolucion(NotificarDevolucion),
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct SedeInfo{
     pub sede_id: u32,
     pub coords: (f64, f64),

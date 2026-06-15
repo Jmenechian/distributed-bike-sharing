@@ -12,6 +12,9 @@ pub const LIVENESS_TIMEOUT: u64 = 15;
 pub const PUERTO_BASE: u16 = 6000;
 pub const MAX_VALUE: f64 = 999999.0;
 
+pub const OFFLINE: bool = false;
+pub const ONLINE: bool = true;
+
 pub fn calcular_distancia(coords_a: (f64, f64), coords_b: (f64, f64)) -> f64 {
     let (coords_sede_x, coords_sede_y) = coords_a;
     let (coords_cliente_x, coords_cliente_y) = coords_b;
