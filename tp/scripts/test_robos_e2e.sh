@@ -124,8 +124,8 @@ setup_cluster() {  # setup_cluster <con_sede2: 0|1>
     levantar procesador_pagos replica3.json proc3
     levantar procesador_pagos replica4.json proc4
     esperar 4 "(estabilización del cluster de pagos)"
-    levantar sede sede1.json sede1
-    [[ "${1:-1}" == "1" ]] && levantar sede sede2.json sede2
+    levantar sede sede/sede1.json sede1
+    [[ "${1:-1}" == "1" ]] && levantar sede sede/sede2.json sede2
     esperar 3 "(descubrimiento / heartbeats)"
 }
 
@@ -244,7 +244,7 @@ e6() {
     enviar cli "devolver_bici"
     esperar 2
     assert_grep "${OUT[sede2]}" "PENDIENTE" "sede2 encoló (origen caído)"
-    levantar sede sede1.json sede1
+    levantar sede sede/sede1.json sede1
     esperar 10 "(heartbeats: sede2 detecta a sede1 ONLINE de nuevo)"
     assert_grep "${OUT[sede2]}" "tengo su bici" "sede2 hizo flush al revivir sede1"
     teardown_cluster

@@ -1,8 +1,8 @@
 use actix::{Actor, Context};
-use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, Handshake, MsgClienteASede, PedirSedes, PreguntarBicis, RespuestaHandshake, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
 use std::io;
@@ -10,7 +10,7 @@ use std::io::BufReader as StdBufReader;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use matenmutex::common::calcular_distancia;
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA};
 use matenmutex::messages::sede_sede::SedeInfo;
 use std::io::Write;
 
@@ -28,6 +28,14 @@ struct ClienteConfig {
     dinero: f64,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct EstadoPersistenteCliente {
+    coords: (f64, f64),
+    bici_activa: Option<BiciAlquilada>,
+    dinero: f64,
+    sedes_conocidas: Vec<SedeInfo>,
+}
+
 pub struct Cliente {
     cliente_id: u32,
     coords: (f64, f64),
@@ -36,6 +44,35 @@ pub struct Cliente {
     bici_activa: Option<BiciAlquilada>,
     dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
+    estado: bool,
+    sede_conectada: Option<SedeInfo>,
+}
+
+fn estado_path_de_id(cliente_id: u32) -> String {
+    format!("estado_cliente_{}.json", cliente_id)
+}
+
+fn cargar_estado_cliente(path: &str) -> Option<EstadoPersistenteCliente> {
+    let file = File::open(path).ok()?;
+    serde_json::from_reader(StdBufReader::new(file)).ok()
+}
+
+fn escribir_snapshot_a(estado_path: &str, snapshot: &EstadoPersistenteCliente) {
+    if estado_path.is_empty() {
+        return;
+    }
+
+    let json = match serde_json::to_vec_pretty(snapshot) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("[persistencia] no se pudo serializar el estado: {e}");
+            return;
+        }
+    };
+    let tmp = format!("{}.tmp", estado_path);
+    if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, estado_path)) {
+        println!("[persistencia] no se pudo escribir {}: {e}", estado_path);
+    }
 }
 
 impl Actor for Cliente {
@@ -52,6 +89,8 @@ impl Cliente {
             bici_activa: None,
             dinero,
             sedes_conocidas: vec![],
+            estado: true,
+            sede_conectada: None,
         }
     }
 
@@ -65,6 +104,8 @@ impl Cliente {
         let x = str_x.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada x invalida: '{str_x}' debe representar un número.")))?;
         let y = str_y.parse::<f64>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("Coordenada y invalida: '{str_y}' debe representar un número.")))?;
         self.coords = (x, y);
+        self.persistir_estado();
+        
         Ok(())
     }
 
@@ -81,6 +122,10 @@ impl Cliente {
     }
 
     fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
+        if !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline"));
+        }
+
         let monto: f64 = monto.parse()
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput,format!("'{}' no es un numero valido", monto),)
@@ -89,6 +134,7 @@ impl Cliente {
         self.dinero += monto;
 
         println!("[cliente] Recarga de ${:.2}. Dinero actual: ${:.2}", monto, self.dinero);
+        self.persistir_estado();
 
         Ok(())
     }
@@ -97,10 +143,55 @@ impl Cliente {
         let addr = format!("127.0.0.1:808{}", n);
         let stream = TcpStream::connect(&addr).await?;
         let (read_half, write_half) = stream.into_split();
-        self.writer = Some(write_half);
-        self.reader = Some(BufReader::new(read_half).lines());
-        println!("Conectado a sede {}", n);
-        Ok(())
+        let mut writer = write_half;
+        let mut reader = BufReader::new(read_half).lines();
+
+        let handshake = MsgClienteASede::Handshake(Handshake { coords: self.coords });
+        let payload = serde_json::to_string(&handshake)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            + "\n";
+        writer.write_all(payload.as_bytes()).await?;
+
+        match reader.next_line().await {
+            Ok(Some(line)) => match serde_json::from_str::<RespuestaHandshake>(&line) {
+                Ok(RespuestaHandshake::Aceptado(coords)) => {
+                    self.writer = Some(writer);
+                    self.reader = Some(reader);
+                    let sede_id: u32 = n.parse().unwrap_or(0);
+                    self.sede_conectada = Some(SedeInfo {
+                        sede_id,
+                        coords,
+                        ..Default::default()
+                    });
+                    println!("Conectado a sede {}", n);
+                    Ok(())
+                }
+                Ok(RespuestaHandshake::Rechazado(razon)) => {
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, razon))
+                }
+                Err(e) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, format!("Handshake invalido: {}", e)))
+                }
+            },
+            _ => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "La sede cerro la conexion durante el handshake")),
+        }
+    }
+
+    fn esta_en_rango(&self) -> bool {
+        match &self.sede_conectada {
+            Some(sede) => calcular_distancia(sede.coords, self.coords) <= DISTANCIA_MINIMA,
+            None => true,
+        }
+    }
+
+    fn online(&mut self) {
+        self.estado = true;
+        println!("[cliente] Estoy online");
+    }
+
+    fn offline(&mut self) {
+        self.estado = false;
+        println!("[cliente] Estoy offline");
     }
 
     fn print_sedes(sedes: &[SedeInfo], coords: (f64, f64)) {
@@ -119,6 +210,9 @@ impl Cliente {
         }
     }
     async fn pedir_sedes(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
         let coords = self.coords;
         let (writer, reader) = self.validar_conexion()?;
         let respuesta = Self::enviar_info_sedes_cercanas(coords, writer, reader).await?;
@@ -126,6 +220,11 @@ impl Cliente {
         if let Some(json) = respuesta {
             match serde_json::from_str::<Vec<SedeInfo>>(&json) {
                 Ok(sedes) => {
+                    if sedes.is_empty() {
+                        println!("[cliente] La sede esta offline y fuera de rango");
+                        Cliente::print_sedes(&self.sedes_conocidas, coords);
+                        return Ok(());
+                    }
                     self.sedes_conocidas = sedes;
                 }
                 Err(e) => {
@@ -133,14 +232,19 @@ impl Cliente {
                 }
             }
         } else {
-            eprintln!("[warn] respuesta vacia, no se recibieron sedes");
+            eprintln!("[error] respuesta vacia, no se recibieron sedes");
         }
 
         Cliente::print_sedes(&self.sedes_conocidas, coords);
+        self.persistir_estado();
         Ok(())
     }
 
     async fn solicitar_bici(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
+
         if self.bici_activa.is_some() {
             println!("[cliente] Ya tenes una bici");
             return Ok(());
@@ -156,6 +260,7 @@ impl Cliente {
 
         let respuesta = self.enviar_ack_comprobante(bici).await?;
         self.descifrar_respuesta_de_ack_comprobante(respuesta, dinero);
+        self.persistir_estado();
 
         Ok(())
     }
@@ -210,6 +315,10 @@ impl Cliente {
     }
 
     async fn devolver_bici(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
+
         if self.bici_activa.is_none() {
             return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
@@ -230,6 +339,7 @@ impl Cliente {
             }
         }
 
+        self.persistir_estado();
         Ok(())
     }
 
@@ -272,6 +382,17 @@ impl Cliente {
             )),
         }
     }
+
+    fn persistir_estado(&self) {
+        let path = estado_path_de_id(self.cliente_id);
+        let snapshot = EstadoPersistenteCliente {
+            coords: self.coords,
+            bici_activa: self.bici_activa.clone(),
+            dinero: self.dinero,
+            sedes_conocidas: self.sedes_conocidas.clone(),
+        };
+        escribir_snapshot_a(&path, &snapshot);
+    }
 }
 
 
@@ -306,6 +427,16 @@ async fn main() {
         }
     };
 
+    let estado_path = estado_path_de_id(cliente.cliente_id);
+    if let Some(estado) = cargar_estado_cliente(&estado_path) {
+        cliente.coords = estado.coords;
+        if let Some(bici) = estado.bici_activa {
+            cliente.bici_activa = Some(bici);
+        }
+        cliente.dinero = estado.dinero;
+        cliente.sedes_conocidas = estado.sedes_conocidas;
+    }
+
     listar_comandos();
 
     let stdin = tokio::io::stdin();
@@ -322,6 +453,8 @@ async fn main() {
             ["devolver_bici"] => cliente.devolver_bici().await,
             ["info_bicis"] => cliente.info_bicis().await,
             ["bici"] => Ok(cliente.mostrar_bici()),
+            ["online"] => Ok(cliente.online()),
+            ["offline"] => Ok(cliente.offline()),
             ["ver_dinero"] => Ok(cliente.mostrar_dinero()),
             ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
@@ -346,6 +479,8 @@ fn listar_comandos() {
          {BOLD}Comandos disponibles:{RESET}\n\
          {GREEN}  mover <x> <y>{RESET}                  - Moverse una distancia\n\
          {GREEN}  conectar_sede <n>{RESET}              - Conectar a una sede\n\
+         {GREEN}  online{RESET}                         - Cambiar a modo online\n\
+         {GREEN}  offline{RESET}                        - Cambiar a modo offline\n\
          {GREEN}  solicitar_bici{RESET}                 - Solicitar una bici\n\
          {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
          {GREEN}  info_bicis{RESET}                     - Ver bicis disponibles\n\

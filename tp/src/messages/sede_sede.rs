@@ -21,7 +21,7 @@ pub enum MsgSedeASede {
     NotificarDevolucion(NotificarDevolucion),
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 pub struct SedeInfo{
     pub sede_id: u32,
     pub coords: (f64, f64),
@@ -114,23 +114,6 @@ pub struct DevolucionRecibida {
     pub estado_pago: EstadoConciliacion,
     pub estado_notificacion_origen: EstadoConciliacion,
 }
-
-pub struct PagoPendiente {
-    payment_request_id: String,
-    alquiler_id: String,
-    cliente_id: String,
-    monto: f64,
-    tipo: TipoPagoPendiente,
-    intentos: u8,
-}
-
-pub enum TipoPagoPendiente {
-    PreAutorizacion,
-    CobroFinal,
-    MultaRobo,
-    ReembolsoPenalizacion,
-}
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NotificacionPendiente {

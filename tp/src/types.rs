@@ -1,7 +1,7 @@
 use crate::messages::sede_procesador::MsgSedeAProcesadorPagos;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::messages::sede_sede::{MsgSedeASede, MsgSedeHeartbeat};
+use crate::messages::sede_sede::MsgSedeHeartbeat;
 
 pub fn timestamp_actual() -> u64 {
     SystemTime::now()
@@ -308,7 +308,7 @@ mod tests_pagos {
 #[cfg(test)]
 mod tests_persistencia_sede {
     use super::*;
-    use crate::messages::sede_sede::{crear_info_dummy, Heartbeat, MsgSedeASede, MsgSedeHeartbeat};
+    use crate::messages::sede_sede::{crear_info_dummy, Heartbeat, MsgSedeHeartbeat};
 
     #[test]
     fn alquiler_activo_round_trip() {
