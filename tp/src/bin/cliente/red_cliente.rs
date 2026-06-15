@@ -1,5 +1,5 @@
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA};
 use matenmutex::messages::cliente_sede::{Handshake, MsgClienteASede, RespuestaHandshake};
-use matenmutex::messages::sede_sede::SedeInfo;
 use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -25,6 +25,18 @@ pub(crate) async fn enviar_mensaje_a_sede(
 
 impl Cliente {
     pub(crate) async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
+        let sede_id: u32 = n.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("'{}' no es un numero de sede valido", n))
+        })?;
+
+        if !self.estado {
+            if let Some(&sede_coords) = self.sedes_posiciones.get(&sede_id) {
+                if calcular_distancia(sede_coords, self.coords) > DISTANCIA_MINIMA {
+                    return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+                }
+            }
+        }
+
         let addr = format!("127.0.0.1:808{}", n);
         let stream = TcpStream::connect(&addr).await?;
         let (read_half, write_half) = stream.into_split();
@@ -42,12 +54,8 @@ impl Cliente {
                 Ok(RespuestaHandshake::Aceptado(coords)) => {
                     self.writer = Some(writer);
                     self.reader = Some(reader);
-                    let sede_id: u32 = n.parse().unwrap_or(0);
-                    self.sede_conectada = Some(SedeInfo {
-                        sede_id,
-                        coords,
-                        ..Default::default()
-                    });
+                    self.sede_conectada = sede_id;
+                    self.sedes_posiciones.insert(sede_id, coords);
                     println!("Conectado a sede {}", n);
                     Ok(())
                 }

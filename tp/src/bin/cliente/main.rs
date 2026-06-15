@@ -3,6 +3,7 @@ use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA};
 use matenmutex::messages::sede_sede::SedeInfo;
 use matenmutex::types::BiciAlquilada;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io;
@@ -24,11 +25,20 @@ const BOLD_CYAN: &str = "\x1b[1;36m";
 const CONFIG_FILE: usize = 1;
 
 #[derive(Deserialize)]
+struct SedePosicionConfig {
+    sede_id: u32,
+    coord_x: f64,
+    coord_y: f64,
+}
+
+#[derive(Deserialize)]
 struct ClienteConfig {
     cliente_id: u32,
     coord_x: f64,
     coord_y: f64,
     dinero: f64,
+    #[serde(default)]
+    sedes: Vec<SedePosicionConfig>,
 }
 
 pub(crate) struct Cliente {
@@ -40,7 +50,8 @@ pub(crate) struct Cliente {
     dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
     estado: bool,
-    sede_conectada: Option<SedeInfo>,
+    sede_conectada: u32,
+    sedes_posiciones: HashMap<u32, (f64, f64)>,
 }
 
 impl Actor for Cliente {
@@ -48,7 +59,7 @@ impl Actor for Cliente {
 }
 
 impl Cliente {
-    fn new(cliente_id: u32, coords: (f64, f64), dinero: f64) -> Self {
+    fn new(cliente_id: u32, coords: (f64, f64), dinero: f64, sedes_posiciones: HashMap<u32, (f64, f64)>) -> Self {
         Cliente {
             cliente_id,
             coords,
@@ -58,14 +69,18 @@ impl Cliente {
             dinero,
             sedes_conocidas: vec![],
             estado: true,
-            sede_conectada: None,
+            sede_conectada: 0,
+            sedes_posiciones,
         }
     }
 
     fn from_json(file_path: &str) -> Result<Cliente, Box<dyn std::error::Error>> {
         let file = File::open(file_path)?;
         let config: ClienteConfig = serde_json::from_reader(StdBufReader::new(file))?;
-        Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero))
+        let sedes_posiciones: HashMap<u32, (f64, f64)> = config.sedes.iter()
+            .map(|s| (s.sede_id, (s.coord_x, s.coord_y)))
+            .collect();
+        Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero, sedes_posiciones))
     }
 
     fn mover(&mut self, str_x: &str, str_y: &str) -> Result<(), io::Error> {
@@ -108,8 +123,8 @@ impl Cliente {
     }
 
     fn esta_en_rango(&self) -> bool {
-        match &self.sede_conectada {
-            Some(sede) => calcular_distancia(sede.coords, self.coords) <= DISTANCIA_MINIMA,
+        match self.sedes_posiciones.get(&self.sede_conectada) {
+            Some(&coords) => calcular_distancia(coords, self.coords) <= DISTANCIA_MINIMA,
             None => true,
         }
     }
@@ -219,7 +234,7 @@ mod tests {
     use super::*;
 
     fn cliente_de_prueba() -> Cliente {
-        Cliente::new(1, (-34.6037, -58.3816), 9999999.0)
+        Cliente::new(1, (-34.6037, -58.3816), 9999999.0, HashMap::new())
     }
 
     #[test]

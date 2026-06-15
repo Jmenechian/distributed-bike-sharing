@@ -44,6 +44,12 @@ impl Cliente {
                         return Ok(());
                     }
                     self.sedes_conocidas = sedes;
+                    for sede in &self.sedes_conocidas {
+                        if !self.sedes_posiciones.contains_key(&sede.sede_id) {
+                            self.sedes_posiciones.insert(sede.sede_id, sede.coords);
+                            println!("[cliente] Nuevas sedes descubiertas: sede {} en ({:.4}, {:.4})", sede.sede_id, sede.coords.0, sede.coords.1);
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[error] fallo al deserializar sedes: {} | json: {}", e, json);
@@ -195,7 +201,7 @@ mod tests {
     use matenmutex::types::Bici;
 
     fn cliente_de_prueba() -> Cliente {
-        Cliente::new(1, (-34.6037, -58.3816), 9999999.0)
+        Cliente::new(1, (-34.6037, -58.3816), 9999999.0, std::collections::HashMap::new())
     }
 
     fn bici_alquilada_de_prueba(bici_id: &str) -> BiciAlquilada {
