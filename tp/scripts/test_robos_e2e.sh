@@ -119,10 +119,10 @@ assert_no_grep() {  # assert_no_grep <archivo> <regex> <descripcion>
 setup_cluster() {  # setup_cluster <con_sede2: 0|1>
     limpiar_estado
     # Cluster de pagos completo: el líder corre 2PC con sus réplicas, así que necesita quórum.
-    levantar procesador_pagos lider.json proc
-    levantar procesador_pagos replica.json proc2
-    levantar procesador_pagos replica3.json proc3
-    levantar procesador_pagos replica4.json proc4
+    levantar procesador_pagos procesador_pagos/lider.json proc
+    levantar procesador_pagos procesador_pagos/replica.json proc2
+    levantar procesador_pagos procesador_pagos/replica3.json proc3
+    levantar procesador_pagos procesador_pagos/replica4.json proc4
     esperar 4 "(estabilización del cluster de pagos)"
     levantar sede sede/sede1.json sede1
     [[ "${1:-1}" == "1" ]] && levantar sede sede/sede2.json sede2
