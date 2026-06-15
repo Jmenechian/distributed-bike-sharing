@@ -27,7 +27,7 @@ La separación queda definida de la siguiente forma:
 
 - App `Cliente`
     - Maneja la interacción del usuario.
-    - Mantiene una caché local de sedes conocidas.
+    - Guarda la última información de sedes que recibió.
     - Se comunica con las Sedes por TCP.
 
 - App `Sede`
@@ -130,7 +130,7 @@ pub struct Bici {
 
 `Slot` es el único componente del sistema modelado como actor interno de una Sede. No corre como aplicación independiente ni expone una conexión TCP propia. Su ciclo de vida está administrado por la App Sede que lo contiene.
 
-Cada Sede tiene entre 10 y 20 slots. Al ser un actor, su estado es gestionado de forma concurrente y segura dentro del modelo de actores. La Sede se comunica con sus Slots mediante `Addr<Slot>`, porque ambos viven dentro del mismo proceso.
+Cada Sede tiene 20 slots, que al iniciar arrancan aleatoriamente en `Vacio` o `Disponible`. Al ser un actor, su estado es gestionado de forma concurrente y segura dentro del modelo de actores. La Sede se comunica con sus Slots mediante `Addr<Slot>`, porque ambos viven dentro del mismo proceso.
 
 ```rs
 pub struct Slot {
@@ -155,34 +155,37 @@ Los tres estados describen la relación del slot con la bicicleta que alberga. U
 
 ### Mensajes que recibe
 
+La Sede le habla al Slot con mensajes Actix individuales, cada uno con su propio tipo de respuesta.
+
 ```rs
-pub enum MsgSedeASlot {
-    Reservar,
-    Confirmar,
-    Cancelar,
-    AsegurarBici { bici_id: String },
-    Consultar,
-}
+struct Reservar;        // -> ResultadoReserva { Reservada(String), Rechazada }
+struct Confirmar;       // -> bool
+struct Cancelar;        // -> bool
+struct AsegurarBici { bici_id: String }; // -> bool
+struct ConsultarBici;   // -> String
+struct ExportarEstado;  // -> EstadoSlotPersistido
 ```
 
-* **Reservar**: Intenta llevar el slot del estado `Disponible` al estado `Reservado`. Si el slot no está en estado `Disponible`, rechaza la operación. Se envía con `send().await` ya que la Sede necesita saber si la reserva fue exitosa antes de continuar con la saga.
-* **Confirmar**: Transiciona el slot de `Reservado` a `Vacio`, indicando que la bicicleta fue entregada al cliente y el slot quedó libre para recibir devoluciones. Se envía con `send().await` como parte de la confirmación final de la saga.
-* **Cancelar**: Transiciona el slot de `Reservado` a `Disponible`, restaurando el `bici_id` que el estado `Reservado` preservaba. Es el mecanismo de rollback dentro de la saga de alquiler cuando algún paso posterior falla.
-* **AsegurarBici**: Transiciona el slot de `Vacio` a `Disponible`, registrando la bicicleta devuelta por el cliente. Se envía con `send().await` durante el flujo de devolución para confirmar que el slot puede recibir la bici.
-* **Consultar**: Devuelve el estado actual del slot. Se usa para que la Sede pueda construir su información de disponibilidad.
+* **Reservar**: Lleva el slot de `Disponible` a `Reservado`. Devuelve `Reservada(bici_id)` si lo logra y `Rechazada` en caso contrario. La Sede lo envía con `send().await` porque necesita el resultado antes de seguir la saga.
+* **Confirmar**: Transiciona el slot de `Reservado` a `Vacio` cuando la bici fue entregada al cliente. Devuelve `true` si el slot estaba reservado.
+* **Cancelar**: Transiciona el slot de `Reservado` a `Disponible`, restaurando el `bici_id`. Es el rollback de la saga cuando un paso posterior falla.
+* **AsegurarBici**: Transiciona el slot de `Vacio` a `Disponible` con la bici devuelta. Lo usa el flujo de devolución.
+* **ConsultarBici**: Devuelve una descripción textual del slot para la CLI.
+* **ExportarEstado**: Devuelve el `EstadoSlotPersistido` del slot, que la Sede usa para armar el snapshot.
  
 ## Cliente
  
-El Cliente es una aplicación independiente que representa la app móvil del usuario. Se comunica con las Sedes a través de conexiones TCP. 
+El Cliente es una aplicación independiente que representa la app móvil del usuario. Se comunica con la Sede a la que está conectado mediante una conexión TCP y se opera por una CLI.
 
-Mantiene una caché local de sedes conocidas que le permite operar en modo offline cuando no hay conectividad.
- 
 ```rs
 pub struct Cliente {
-    cliente_id: String,
+    cliente_id: u32,
     coords: (f64, f64),
+    writer: Option<OwnedWriteHalf>,
+    reader: Option<Lines<BufReader<OwnedReadHalf>>>,
     bici_activa: Option<BiciAlquilada>,
-    sedes_cacheadas: Vec<SedeInfo>,
+    dinero: f64,
+    sedes_conocidas: Vec<SedeInfo>,
 }
 
 pub struct BiciAlquilada {
@@ -195,94 +198,80 @@ pub struct BiciAlquilada {
 }
 ```
 
-El campo `bici_activa` almacena la bicicleta que el cliente tiene alquilada en un momento dado. A diferencia de la bicicleta física, `BiciAlquilada` también guarda el `alquiler_id`, el `cliente_id`, la `sede_origen_id` y el `inicio_ts`.
+`writer` y `reader` son las mitades de la conexión TCP a la Sede actual. `dinero` es el saldo del cliente, que se descuenta al alquilar y al devolver. `sedes_conocidas` guarda la última información de sedes que devolvió un `PedirSedes`.
 
-Estos datos funcionan como un comprobante mínimo del alquiler activo: el Cliente no interpreta la lógica del alquiler ni calcula montos, pero conserva la información necesaria para que cualquier Sede pueda procesar una devolución.
-
-El campo `cliente_id` permite asociar el cobro con el usuario correspondiente. El campo `inicio_ts` permite que la Sede destino calcule la duración del alquiler y el monto proporcional al tiempo de uso sin depender de un registro global centralizado de alquileres activos.
-
-Esto permite que una bicicleta pueda ser devuelta en una Sede distinta a la de origen sin depender de un registro global centralizado de alquileres activos.
+`bici_activa` es el comprobante del alquiler en curso. Además del `bici_id`, la `BiciAlquilada` guarda `alquiler_id`, `cliente_id`, `sede_origen_id`, `inicio_ts` y `token_alquiler`. Con esos datos cualquier Sede puede procesar la devolución: identificar la bici, validar el token, calcular el monto a partir de `inicio_ts` y avisar a la Sede origen, sin depender de un registro global de alquileres.
 
 ### Mensajes que envía
 
 ```rs
 pub enum MsgClienteASede {
-    SolicitarBici { cliente_id: String, coords: (f64, f64) },
-    AckComprobanteAlquiler { alquiler_id: String },
-    DevolverBici  { bici: BiciAlquilada, coords: (f64, f64) },
-    PedirSedes    { coords: (f64, f64) },
+    SolicitarBici(SolicitarBici),                   // { cliente_id: u32, coords: (f64, f64), dinero: f64 }
+    AckComprobanteAlquiler(AckComprobanteAlquiler), // { alquiler_id: String }
+    DevolverBici(DevolverBici),                     // { bici: BiciAlquilada, coords: (f64, f64), dinero: f64 }
+    PreguntarBicis(PreguntarBicis),
+    PedirSedes(PedirSedes),                         // { coords: (f64, f64) }
 }
 ```
 
+`SolicitarBici` y `DevolverBici` incluyen el `dinero` actual del cliente para que la Sede valide que tiene saldo suficiente.
+
 #### DevolverBici
 
-El cliente envía este mensaje cuando desea devolver la bicicleta que tiene alquilada. Lo puede enviar a cualquier Sede con espacio disponible, no necesariamente a la de origen. El mensaje incluye la información mínima del alquiler activo para que la Sede destino pueda identificar la bicicleta, calcular el cobro y notificar a la Sede origen que el alquiler fue cerrado.
+El cliente lo envía para devolver la bicicleta que tiene alquilada. Lo puede mandar a cualquier Sede con espacio, no necesariamente a la de origen. Incluye la `BiciAlquilada` para que la Sede destino identifique la bici, calcule el cobro y avise a la Sede origen que el alquiler se cerró.
+
+#### PreguntarBicis
+
+El cliente lo envía para ver el estado de los slots de la Sede a la que está conectado. La Sede responde con un texto que describe cada slot y cuántos están ocupados.
 
 #### PedirSedes
 
-El cliente envía este mensaje para obtener información actualizada sobre las sedes del sistema: coordenadas, disponibilidad de slots y estado de conectividad. La Sede responde con la información que conoce de sí misma y de las sedes vecinas registradas en su `sedes_conocidas`.
+El cliente lo envía para obtener información de las sedes cercanas: coordenadas, disponibilidad de slots y conectividad. La Sede responde con lo que conoce de sí misma y de las sedes vecinas en su `sedes_conocidas`.
 
-No existe una Sede central para resolver este pedido. Todas las Sedes son pares: cada una responde con la información que conoce localmente y con la información que fue recibiendo mediante heartbeats de sedes cercanas. Por eso la respuesta puede ser eventualmente consistente. El campo `ultimo_update_ts` de cada `SedeInfo` permite saber qué tan reciente es cada dato.
-
-Este mensaje implementa un mecanismo de caché con fallback: si el cliente no recibe respuesta dentro de un tiempo de espera definido, usa su `sedes_cacheadas` local como respaldo. Esto garantiza que la funcionalidad de visualización de sedes opere incluso sin conectividad.
+No hay una Sede central que resuelva este pedido. Todas las Sedes son pares y cada una responde con su información local más la que recibió por heartbeats, así que la respuesta es eventualmente consistente. El campo `ultimo_update_ts` de cada `SedeInfo` indica qué tan reciente es cada dato.
 
 ### Mensajes que recibe
 
-#### ComprobanteAlquilerEmitido
-
-Respuesta intermedia durante `SolicitarBici`. La Sede envía una `BiciAlquilada` con `token_alquiler` antes de liberar físicamente la bicicleta.
-
-El Cliente guarda este comprobante de forma temporal y responde `AckComprobanteAlquiler { alquiler_id }`. La Sede no confirma el Slot hasta recibir este ack, porque necesita asegurarse de que el Cliente ya tiene el comprobante firmado necesario para una futura devolución.
+Las respuestas de la Sede al Cliente viajan en dos enums según el pedido. `PedirSedes` responde directamente un `Vec<SedeInfo>` y `PreguntarBicis` un `String`.
 
 ```rs
-ComprobanteAlquilerEmitido { bici: BiciAlquilada }
+pub enum RespuestaSolicitarBici {
+    ComprobanteAlquilerEmitido(BiciAlquilada, f64),
+    AlquilerConfirmado(BiciAlquilada),
+    AlquilerRechazado(String),
+}
+
+pub enum RespuestaDevolverBici {
+    DevolucionOk(Bici, f64),
+    DevolucionRechazada(String),
+}
 ```
+
+#### ComprobanteAlquilerEmitido
+
+Respuesta intermedia de `SolicitarBici`. La Sede envía la `BiciAlquilada` firmada junto con el dinero restante del cliente, antes de liberar la bici. El Cliente lo guarda de forma temporal y responde `AckComprobanteAlquiler`. La Sede no confirma el slot hasta recibir ese ack.
 
 #### AlquilerConfirmado
 
-Respuesta exitosa final a `SolicitarBici`. Indica que la bicicleta fue asignada, el comprobante firmado ya fue entregado al Cliente y el slot fue confirmado. A partir de este mensaje, el Cliente guarda definitivamente la `BiciAlquilada` en `bici_activa` y luego la reenvía al momento de devolverla.
-
-```rs
-AlquilerConfirmado { bici: BiciAlquilada }
-```
+Respuesta final exitosa de `SolicitarBici`. El slot quedó confirmado y la bici asignada. El Cliente guarda la `BiciAlquilada` en `bici_activa` y la reenvía al devolverla.
 
 #### AlquilerRechazado
 
-Respuesta fallida a `SolicitarBici`. Indica el motivo por el cual no fue posible realizar el alquiler, por ejemplo falta de disponibilidad o fallo en la pre-autorización de pago.
-
-```rs
-AlquilerRechazado { motivo: String }
-```
+Respuesta fallida de `SolicitarBici`, con el motivo: fuera de radio, saldo insuficiente, sin disponibilidad o pago rechazado.
 
 #### DevolucionOk
 
-Respuesta exitosa a `DevolverBici`. Incluye la duración del alquiler y el monto cobrado proporcional al tiempo de uso.
-
-```rs
-DevolucionOk { monto: f64, duracion_min: u64 }
-```
+Respuesta exitosa de `DevolverBici`. Incluye la `Bici` devuelta y el dinero restante del cliente.
 
 #### DevolucionRechazada
 
-Respuesta fallida a `DevolverBici`. Indica que la Sede no pudo recibir la bicicleta, por ejemplo porque no tiene slots vacíos, porque el Cliente está fuera del radio permitido o porque el `token_alquiler` es inválido.
-
-```rs
-DevolucionRechazada { motivo: String }
-```
-
-#### RespuestaSedes
-
-Respuesta a `PedirSedes`. Contiene la información de todas las sedes que la Sede contactada conoce, incluyendo las propagadas mediante heartbeats de sedes vecinas.
-
-```rs
-RespuestaSedes { sedes: Vec<SedeInfo> }
-```
+Respuesta fallida de `DevolverBici`, con el motivo: fuera de radio, sin slots vacíos, token inválido, saldo insuficiente o cobro rechazado.
  
 ---
  
 ## Sede
 
-La `Sede` es una aplicación independiente del sistema. Representa una estación física con capacidad para entre 10 y 20 bicicletas. Gestiona sus slots, procesa alquileres, recibe devoluciones, mantiene información parcial sobre sedes vecinas y puede operar tanto conectada como desconectada.
+La `Sede` es una aplicación independiente del sistema. Representa una estación física con 20 slots. Gestiona sus slots, procesa alquileres, recibe devoluciones, mantiene información parcial sobre sedes vecinas y puede operar tanto conectada como desconectada.
 
 Cada Sede es responsable de persistir localmente la parte del estado que le corresponde. No existe un registro global centralizado de alquileres activos. En particular:
 
@@ -298,29 +287,27 @@ pub struct Sede {
     sede_id: u32,
     coords: (f64, f64),
     slots: Vec<Addr<Slot>>,
+    token_secret: [u8; SECRET_LEN],
+    pending_reservas: HashMap<String, (usize, BiciAlquilada)>,
+    sedes_conocidas: Vec<SedeInfo>,
+    sede_info: SedeInfo,
+    procesador_pagos_addrs: Vec<String>,
+    lider_cacheado: Arc<Mutex<Option<String>>>,
+    estado_path: String,
     alquileres_activos: Vec<AlquilerActivo>,
     devoluciones_recibidas: Vec<DevolucionRecibida>,
     pagos_pendientes: Vec<PagoPendiente>,
     notificaciones_pendientes: Vec<NotificacionPendiente>,
-    log_local: Vec<EventoSede>,
-    estado_red: EstadoRed,
-    sedes_conocidas: Vec<SedeInfo>,
-    nodos_pago: Vec<SocketAddr>,
-    procesador_pagos_lider: Option<SocketAddr>,
+    offline: Arc<Mutex<bool>>,
+    estaba_offline: bool,
 }
 ```
 
-El campo `slots` contiene las direcciones de los actores `Slot`, que son internos a la aplicación de Sede. En cambio, `nodos_pago` contiene direcciones de red de procesos `ProcesadorPagos`, por lo que la comunicación con pagos no usa `Addr<T>` sino TCP. El campo `procesador_pagos_lider` guarda el nodo de pagos que actualmente actúa como coordinador elegido por Bully. Si ese líder no responde, la Sede puede reintentar contra otro nodo conocido para que los procesadores ejecuten una nueva elección.
+`slots` son las `Addr<Slot>` de los actores internos. `procesador_pagos_addrs` son las direcciones TCP de los nodos `ProcesadorPagos`, con los que la Sede habla por TCP en lugar de `Addr<T>`. `lider_cacheado` guarda el último líder de pagos que respondió. Si falla o contesta `NoSoyLider`, se invalida el cache y se prueban los demás nodos.
 
-El campo `alquileres_activos` contiene los alquileres que fueron iniciados en esta Sede y todavía no fueron cerrados. Si una bicicleta sale desde la Sede A, entonces la Sede A es la responsable de recordar que ese alquiler está activo.
+`token_secret` es el secreto compartido con el que se genera y valida el `token_alquiler`. `pending_reservas` mapea `alquiler_id → (slot, comprobante)` para las reservas en curso hasta que se confirman. `sede_info` es la `SedeInfo` propia que se propaga por heartbeat. `estado_path` es el archivo de snapshot.
 
-El campo `devoluciones_recibidas` contiene las devoluciones que esta Sede recibió. Si la bicicleta había salido desde otra Sede, esta devolución queda pendiente de conciliación hasta que se notifique correctamente a la Sede origen.
-
-El campo `pagos_pendientes` almacena cobros que todavía no pudieron confirmarse contra un `ProcesadorPagos`, por ejemplo porque todos los nodos de pago conocidos estaban caídos o no respondieron a tiempo.
-
-El campo `notificaciones_pendientes` almacena mensajes que deben enviarse a otras sedes cuando vuelva la conectividad. El caso principal es notificar a la Sede origen que una bicicleta fue devuelta en esta Sede.
-
-El campo `log_local` persiste los eventos relevantes de la Sede, incluyendo snapshots del estado actual de todos sus slots. No funciona como historial global del sistema, sino como mecanismo de recuperación local: si la Sede se cae y vuelve a iniciar, puede reconstruir sus slots, alquileres activos, devoluciones recibidas, pagos pendientes y notificaciones pendientes desde este log.
+`alquileres_activos` son los alquileres iniciados en esta Sede que siguen abiertos y `devoluciones_recibidas` son las devoluciones que recibió. `notificaciones_pendientes` guarda las devoluciones que no se pudieron avisar a la Sede origen y se reintentan al reconectar. `pagos_pendientes` está reservado para cobros no confirmados.
 
 ### Sedes pares y descubrimiento por heartbeats
 
@@ -330,18 +317,11 @@ La comunicación entre Sedes se usa solo para los casos necesarios: propagar inf
 
 Cada Sede sigue siendo responsable de persistir localmente los alquileres que originó y las devoluciones que recibió. Si una bicicleta se devuelve en una Sede distinta a la de origen, la Sede destino notifica directamente a la Sede origen para que esta cierre el alquiler activo correspondiente.
 
-La caída de una Sede no altera el funcionamiento. Las otras Sedes simplemente continúan operando con su estado local y con la última información recibida por heartbeats. Cuando la Sede caída vuelve, retoma el envío de heartbeats y reintenta sus pagos o notificaciones pendientes.
+La caída de una Sede no altera el funcionamiento. Las otras Sedes continúan operando con su estado local y con la última información recibida por heartbeats. Cuando la Sede caída vuelve, retoma el envío de heartbeats y reintenta sus notificaciones pendientes.
 
-### EstadoRed
+### Conectividad
 
-```rs
-pub enum EstadoRed {
-    Conectado,
-    Desconectado { desde_ts: u64 },
-}
-```
-
-El `estado_red` determina el comportamiento de la Sede ante solicitudes entrantes y ante la necesidad de comunicarse con otros procesos. Una Sede desconectada puede seguir operando localmente con sus slots, persistiendo los eventos que no pueda conciliar en el momento.
+La conectividad se representa con el flag `offline: Arc<Mutex<bool>>`, que se puede alternar por CLI para simular caídas. Estando offline, la Sede sigue operando localmente con sus slots y encola las notificaciones que no puede entregar. El flag `estaba_offline` registra que estuvo caída, de modo que al reconectarse dispara el reintento de esas notificaciones.
 
 ### Estado local de alquileres y devoluciones
 
@@ -382,18 +362,9 @@ pub struct DevolucionRecibida {
 
 pub struct PagoPendiente {
     payment_request_id: String,
-    alquiler_id: String,
+    alquiler_id: Option<String>,
     cliente_id: String,
-    monto: f64,
-    tipo: TipoPagoPendiente,
-    intentos: u8,
-}
-
-pub enum TipoPagoPendiente {
-    PreAutorizacion,
-    CobroFinal,
-    MultaRobo,
-    ReembolsoPenalizacion,
+    mensaje: MsgSedeAProcesadorPagos,
 }
 
 pub struct NotificacionPendiente {
@@ -405,6 +376,7 @@ pub struct NotificacionPendiente {
     fin_ts: u64,
     monto: f64,
     pago_id: Option<String>,
+    token_alquiler: String,
     intentos: u8,
 }
 
@@ -415,200 +387,56 @@ pub enum EstadoConciliacion {
 }
 ```
 
-`AlquilerActivo` representa un alquiler iniciado en esta Sede que todavía no fue cerrado. Cuando la bicicleta se devuelve en la misma Sede, puede cerrarse localmente. Si se devuelve en otra Sede, se cierra cuando llega una notificación desde la Sede destino.
+`AlquilerActivo` es un alquiler iniciado en esta Sede que sigue abierto. Si la bici se devuelve en la misma Sede se cierra localmente, y si se devuelve en otra se cierra cuando llega `NotificarDevolucion`.
 
-El campo `deadline_devolucion_ts` representa el tiempo máximo que la Sede origen espera para recibir una devolución. La Sede origen no hace un pull activo ni consulta a todas las sedes para preguntar si vieron la bicicleta. Si pasado ese tiempo no recibió `NotificarDevolucion`, marca el alquiler como sospechoso y luego como robo confirmado según la política definida por la simulación.
+El `estado` distingue si el alquiler está `Activo`, `Cerrado`, `RoboConfirmado` o `RoboRevertido`. Al emitir el comprobante, la Sede programa una verificación: si pasados 60 segundos el alquiler sigue `Activo`, lo marca `RoboConfirmado` y captura el depósito como multa con un `CobrarPago`, guardando el resultado en `pago_multa_id`. Si más tarde la bici aparece por una devolución, el estado pasa a `RoboRevertido` y el depósito se reintegra, registrándose en `reembolso_multa_id`.
 
-El campo `estado` permite distinguir si el alquiler sigue normalmente activo, si pasó a estar bajo sospecha por exceso de tiempo, si ya fue cerrado, si terminó marcado como robo confirmado o si ese robo fue revertido porque más tarde llegó una notificación válida de devolución.
+`DevolucionRecibida` es una bicicleta devuelta en esta Sede. Los campos `estado_pago` y `estado_notificacion_origen` siguen la conciliación del cobro y del aviso a la Sede origen.
 
-Los campos `pago_multa_id` y `reembolso_multa_id` permiten reconstruir qué pasó con la penalización por robo. Si el alquiler se marca como `RoboConfirmado`, la Sede origen cobra una multa al Cliente mediante el `ProcesadorPagos`. Si después aparece una devolución válida enviada tarde por la Sede destino, la Sede origen revierte el estado a `RoboRevertido` y solicita el reembolso de esa penalización.
+`PagoPendiente` guarda el `mensaje` original a reenviar al `ProcesadorPagos` cuando un pago no se pudo confirmar, junto con los datos para reintentarlo.
 
-`DevolucionRecibida` representa una bicicleta que fue devuelta en esta Sede. Puede quedar pendiente de conciliación con el `ProcesadorPagos`, con la Sede origen, o con ambos.
+`NotificacionPendiente` es un aviso de devolución hacia la Sede origen que todavía no se pudo entregar. Lleva el `token_alquiler` y un contador de `intentos`, y cubre el caso en que el destino recibe la bici pero no logra avisarle al origen en el momento.
 
-`PagoPendiente` representa una operación de pago que debe reintentarse. Se utiliza cuando una devolución, una multa por robo o un reembolso no pudieron confirmarse por problemas de conectividad con los nodos de pago.
+### Persistencia y recuperación
 
-`NotificacionPendiente` representa una notificación hacia la Sede origen que todavía no pudo enviarse o confirmarse. Esto cubre el caso donde una Sede recibe una bicicleta y se cae o pierde conectividad antes de avisarle a la Sede que originó el alquiler.
-
-### Log local
+La Sede persiste un snapshot completo de su estado en un archivo JSON (`estado_sede_<id>.json`). Tras cada cambio relevante —reservar, confirmar, cancelar o asegurar una bici, registrar un alquiler o una devolución, agregar un pendiente— vuelca el snapshot de forma atómica, escribiendo un `.tmp` y renombrando.
 
 ```rs
-pub enum EventoSede {
-    EstadoSlotsActualizado {
-        slots: Vec<SlotPersistido>,
-    },
-    TokenAlquilerEmitido {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        sede_origen_id: u32,
-        inicio_ts: u64,
-    },
-    AlquilerIniciado {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        inicio_ts: u64,
-    },
-    AlquilerReconstruidoDesdeToken {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        sede_origen_id: u32,
-        inicio_ts: u64,
-    },
-    AlquilerMarcadoSospechoso {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        desde_ts: u64,
-    },
-    DeadlineDevolucionVencido {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        ts: u64,
-    },
-    DevolucionRecibida {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        sede_origen_id: u32,
-        sede_destino_id: u32,
-        fin_ts: u64,
-        monto: f64,
-    },
-    PagoPendienteRegistrado {
-        payment_request_id: String,
-        alquiler_id: String,
-        cliente_id: String,
-        monto: f64,
-    },
-    PagoConfirmado {
-        alquiler_id: String,
-        payment_request_id: String,
-        pago_id: String,
-    },
-    NotificacionOrigenPendiente {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        sede_origen_id: u32,
-        sede_destino_id: u32,
-        fin_ts: u64,
-        monto: f64,
-        pago_id: Option<String>,
-    },
-    NotificacionOrigenConfirmada {
-        alquiler_id: String,
-        sede_origen_id: u32,
-    },
-    AlquilerCerrado {
-        alquiler_id: String,
-        fin_ts: u64,
-        monto: f64,
-    },
-    RoboConfirmado {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        ts: u64,
-        monto_multa: f64,
-    },
-    MultaRoboCobrada {
-        alquiler_id: String,
-        payment_request_id: String,
-        pago_id: String,
-        monto_multa: f64,
-    },
-    RoboRevertidoPorDevolucionTardia {
-        alquiler_id: String,
-        bici_id: String,
-        sede_destino_id: u32,
-        fin_ts: u64,
-    },
-    ReembolsoPenalizacionConfirmado {
-        alquiler_id: String,
-        payment_request_id: String,
-        pago_id: String,
-        monto_reembolsado: f64,
-    },
-}
-
-pub struct SlotPersistido {
-    slot_id: u32,
-    estado: EstadoSlotPersistido,
+struct EstadoPersistenteSede {
+    slots: Vec<EstadoSlotPersistido>,
+    pending_reservas: Vec<(String, usize, BiciAlquilada)>,
+    alquileres_activos: Vec<AlquilerActivo>,
+    devoluciones_recibidas: Vec<DevolucionRecibida>,
+    pagos_pendientes: Vec<PagoPendiente>,
+    notificaciones_pendientes: Vec<NotificacionPendiente>,
 }
 
 pub enum EstadoSlotPersistido {
     Vacio,
+    Reservado { bici_id: String },
     Disponible { bici_id: String },
-    Reservado { bici_id: String, alquiler_id: String },
 }
 ```
 
-El `log_local` persiste los eventos relevantes de la Sede para poder recuperar su estado luego de una caída. A diferencia de un historial global del sistema, este log es local a cada Sede y solamente representa los hechos que esa Sede necesita recordar.
+Al reiniciar, la Sede carga el snapshot y rehidrata sus colecciones directamente. Los slots se reconstruyen desde `slots`, con una salvedad: un slot `Reservado` cuyo alquiler no aparece respaldado en `alquileres_activos` corresponde a una saga que se cortó antes de confirmarse, así que se compensa volviéndolo a `Disponible`.
 
-Además de guardar eventos de negocio, el log guarda snapshots del estado actual de todos los slots mediante `EstadoSlotsActualizado`. Cada vez que una operación modifica el estado físico de la estación —por ejemplo reservar una bicicleta, cancelar una reserva, confirmar un retiro o asegurar una devolución— la Sede agrega al log una nueva imagen completa de sus slots.
+Como cada Sede tiene 20 slots, persistir el estado completo ante cada cambio no es costoso y simplifica la recuperación: alcanza con leer el último snapshot, sin reconstruir nada evento por evento.
 
-Como cada Sede tiene entre 10 y 20 slots, persistir el estado completo de los slots ante cada cambio no representa una carga significativa y simplifica la recuperación. De esta forma no hace falta reconstruir el estado físico aplicando evento por evento desde el inicio, sino que alcanza con tomar el último `EstadoSlotsActualizado`.
-
-Al reiniciar, la Sede reconstruye su estado local de la siguiente manera:
-
-1. Lee su `log_local`.
-2. Busca el último evento `EstadoSlotsActualizado`.
-3. Reconstruye los actores `Slot` a partir de ese snapshot.
-4. Reconstruye sus alquileres activos, devoluciones recibidas, pagos pendientes y notificaciones pendientes a partir del resto de los eventos del log.
-
-Los campos `slots_vacios` y `slots_disponibles` de `SedeInfo` no se persisten como fuente de verdad. Se calculan a partir del último estado conocido de los slots. Esto evita inconsistencias entre una cantidad guardada y el estado real de cada slot.
-
-El estado `Reservado` representa una reserva en curso dentro de una saga de alquiler. Si la Sede se cae mientras un slot estaba reservado, al reiniciar puede detectar esa saga incompleta y decidir si continuarla o compensarla, por ejemplo cancelando la reserva y volviendo el slot a `Disponible`.
+Los campos `slots_vacios` y `slots_disponibles` de `SedeInfo` se calculan a partir del estado real de los slots, no se guardan como fuente de verdad aparte.
 
 ### Operación Offline
 
-Una Sede puede perder conectividad con el resto del sistema en cualquier momento. En ese caso, continúa operando localmente con la información que tiene disponible: puede alquilar bicicletas propias, recibir devoluciones en slots vacíos y persistir los eventos correspondientes en su `log_local`.
-
-No se intenta sincronizar cada operación contra una Sede central, porque no existe una Sede líder. Toda operación que no pueda completarse por falta de conectividad se guarda localmente en una de las estructuras pendientes de la Sede:
+El flag `offline` se puede activar por CLI para simular que una Sede pierde conectividad. Aun offline, la Sede sigue operando localmente: alquila sus propias bicicletas y recibe devoluciones en slots vacíos. Cuando recibe una devolución de un alquiler originado en otra Sede y no puede avisarle, encola el aviso en `notificaciones_pendientes` y lo persiste en el snapshot.
 
 ```rs
-pagos_pendientes: Vec<PagoPendiente>,
 notificaciones_pendientes: Vec<NotificacionPendiente>,
 ```
 
-`pagos_pendientes` contiene cobros, multas o reembolsos que todavía no pudieron confirmarse contra el servicio de `ProcesadorPagos`.
-
-`notificaciones_pendientes` contiene devoluciones recibidas por esta Sede que todavía no pudieron ser informadas a la Sede donde se originó el alquiler.
-
-Cuando la Sede recupera conectividad simplemente vuelve a enviar heartbeats a sus sedes conocidas y procesa sus pendientes locales:
-
-1. Reintenta los pagos pendientes contra el líder actual del cluster de `ProcesadorPagos` o contra otro nodo de pagos conocido.
-2. Si el pago fue confirmado, actualiza la devolución recibida con el `pago_id`.
-3. Reintenta las notificaciones pendientes hacia las sedes origen correspondientes.
-4. Cuando la Sede origen confirma la notificación, la Sede destino marca la devolución como conciliada.
-
-Este enfoque permite que el sistema funcione con consistencia eventual: durante una partición puede haber sedes con información parcial, pero al recuperar conectividad los estados se reconcilian mediante mensajes pendientes persistidos localmente.
+Al volver online, la Sede detecta la transición con `estaba_offline` y dispara un flush: reenvía cada `NotificacionPendiente` a su Sede origen y, cuando recibe el `AckDevolucion`, la marca como conciliada y la saca de la cola. Así el sistema converge por consistencia eventual: durante la partición las sedes tienen información parcial, y al reconectar reconcilian los avisos persistidos localmente.
 
 ### Mensajes que envía
 
-```rs
-pub enum MsgSedeACliente {
-    ComprobanteAlquilerEmitido { bici: BiciAlquilada },
-    AlquilerConfirmado { bici: BiciAlquilada },
-    AlquilerRechazado  { motivo: String },
-    DevolucionOk       { monto: f64, duracion_min: u64 },
-    DevolucionRechazada{ motivo: String },
-    RespuestaSedes     { sedes: Vec<SedeInfo> },
-}
-```
-
-```rs
-pub enum MsgSedeASlot {
-    Reservar,
-    Confirmar,
-    Cancelar,
-    AsegurarBici { bici_id: String },
-    Consultar,
-}
-```
+Al Cliente le responde con `RespuestaSolicitarBici` y `RespuestaDevolverBici` (sección Cliente), más un `Vec<SedeInfo>` para `PedirSedes` y un `String` para `PreguntarBicis`. A sus Slots les manda los mensajes individuales de la sección Slot. Al `ProcesadorPagos` y a otras Sedes les envía los enums siguientes.
 
 ```rs
 pub enum MsgSedeAProcesadorPagos {
@@ -634,29 +462,28 @@ pub enum MsgSedeAProcesadorPagos {
 ```
 
 ```rs
+pub enum MsgSedeHeartbeat {
+    Heartbeat(Heartbeat), // { sede_id: u32, info: SedeInfo }
+}
+
 pub enum MsgSedeASede {
-    Heartbeat {
-        sede_id: u32,
-        info: SedeInfo,
-    },
-    NotificarDevolucion {
-        alquiler_id: String,
-        bici_id: String,
-        cliente_id: String,
-        sede_origen_id: u32,
-        sede_destino_id: u32,
-        fin_ts: u64,
-        monto: f64,
-        pago_id: Option<String>,
-        token_alquiler: String,
-    },
-    AckDevolucion {
-        alquiler_id: String,
-        sede_origen_id: u32,
-        sede_destino_id: u32,
-    },
+    NotificarDevolucion(NotificarDevolucion),
+}
+
+pub struct NotificarDevolucion {
+    alquiler_id: String,
+    bici_id: String,
+    cliente_id: String,
+    sede_origen_id: u32,
+    sede_destino_id: u32,
+    fin_ts: u64,
+    monto: f64,
+    pago_id: Option<String>,
+    token_alquiler: String,
 }
 ```
+
+`NotificarDevolucion` se responde con `AckDevolucion { alquiler_id }`, que es su tipo de resultado.
 
 #### Heartbeat
 
@@ -670,35 +497,27 @@ Si una Sede deja de recibir heartbeats de otra durante cierto tiempo, puede marc
 
 #### NotificarDevolucion y AckDevolucion
 
-`NotificarDevolucion` es enviado por la Sede destino a la Sede origen cuando una bicicleta se devuelve en una estación distinta a la que inició el alquiler.
+La Sede destino envía `NotificarDevolucion` a la Sede origen cuando una bicicleta se devuelve en una estación distinta a la que inició el alquiler. El destino ya validó el `token_alquiler` antes de aceptar la devolución, y reenvía ese mismo token dentro del mensaje.
 
-El mensaje incluye los datos de la devolución y también el `token_alquiler` que viajaba dentro de la `BiciAlquilada`. Esto permite que la Sede origen pueda validar el comprobante incluso si no encuentra el alquiler en sus `alquileres_activos`.
+Al recibir `NotificarDevolucion`, la Sede origen tiene tres casos:
 
-Al recibir `NotificarDevolucion`, la Sede origen puede encontrarse con tres casos.
+* **Alquiler activo**: encuentra el `alquiler_id` en sus `alquileres_activos`, lo cierra removiéndolo y responde `AckDevolucion`.
+* **Estaba como robo**: si lo tenía en `RoboConfirmado`, interpreta que la bici apareció tarde, lo pasa a `RoboRevertido`, persiste el snapshot y responde `AckDevolucion`.
+* **Ya procesado**: si el alquiler ya estaba cerrado, robado o revertido, responde `AckDevolucion` por idempotencia.
 
-En el caso normal, encuentra el `alquiler_id` en sus `alquileres_activos` con estado `Activo` o `Sospechoso`. Entonces lo marca como cerrado, persiste `AlquilerCerrado` en su `log_local` y responde `AckDevolucion`.
-
-En el caso borde, la Sede origen no encuentra el `alquiler_id`. Esto puede pasar si la Sede se cayó después de liberar físicamente la bicicleta pero antes de persistir `AlquilerIniciado`. En vez de rechazar la devolución, la Sede origen valida el `token_alquiler` usando el secreto compartido entre Sedes. Si el token es válido, reconstruye el alquiler mínimo a partir de los datos firmados, persiste `AlquilerReconstruidoDesdeToken`, luego persiste `AlquilerCerrado` y responde `AckDevolucion`.
-
-En el caso tardío, la Sede origen ya había marcado el alquiler como `RoboConfirmado` porque venció el tiempo máximo y nunca recibió la notificación. Si más tarde llega `NotificarDevolucion` con un token válido, la Sede origen acepta que la bicicleta no fue realmente robada: persiste `RoboRevertidoPorDevolucionTardia`, cierra el alquiler, responde `AckDevolucion` y solicita al `ProcesadorPagos` un `ReembolsarPago` por la penalización cobrada.
-
-Si el token es inválido, la Sede origen rechaza la conciliación porque no puede confiar en los datos recibidos.
-
-Si la Sede destino no puede contactar a la Sede origen, guarda una `NotificacionPendiente` y la reintenta más tarde. Si la Sede destino se cae antes de notificar, al reiniciar reconstruye esa notificación pendiente desde su `log_local`.
-
-Este protocolo evita mantener un registro global de alquileres activos y permite aceptar devoluciones aun cuando la Sede origen haya perdido el registro local del alquiler por una caída en medio de la saga. La Sede origen sigue siendo responsable de los alquileres que inició, pero el token firmado permite reconstruir un alquiler legítimo cuando sea necesario.
+Si la Sede destino no puede contactar a la Sede origen, encola una `NotificacionPendiente` y la reintenta al reconectar. Cuando origen y destino son la misma Sede, la notificación se resuelve localmente sin pasar por TCP.
 
 #### PreAutorizarPago, CobrarPago y ReembolsarPago
 
-Son mensajes enviados por la Sede al líder actual de `ProcesadorPagos` mediante TCP. Ese líder es elegido por los propios nodos de pago usando Bully y actúa como coordinador de un commit de dos fases para que la operación quede replicada de forma consistente entre procesadores.
+La Sede los envía por TCP al líder de `ProcesadorPagos`. Ese líder lo elige Bully entre los nodos de pago y coordina un commit de dos fases para que la operación quede replicada.
 
-`PreAutorizarPago` se utiliza durante la saga de alquiler, antes de confirmar el slot y liberar la bicicleta. Si la pre-autorización falla, la Sede cancela la reserva del slot y rechaza el alquiler.
+`PreAutorizarPago` retiene el depósito durante la saga de alquiler, antes de confirmar el slot y liberar la bici. Si falla, la Sede cancela la reserva del slot y rechaza el alquiler.
 
-`CobrarPago` se utiliza al momento de procesar una devolución y también cuando la Sede origen confirma un robo y debe cobrar una penalización. La Sede genera un `payment_request_id` único para que el pedido sea idempotente. Si el líder de pagos no responde, la Sede puede reintentar el mismo pedido contra otro nodo de pagos usando el mismo `payment_request_id`.
+`CobrarPago` cobra el monto de la devolución por el tiempo de uso, y también captura el depósito como multa cuando un alquiler se marca como robo. La Sede genera un `payment_request_id` único para que el pedido sea idempotente y pueda reintentarlo contra otro nodo con el mismo id.
 
-`ReembolsarPago` se utiliza cuando una bicicleta marcada como robada aparece más tarde por una notificación válida de la Sede destino. En ese caso la Sede origen revierte el robo y solicita al `ProcesadorPagos` el reembolso de la penalización cobrada previamente.
+`ReembolsarPago` reintegra el depósito retenido al cliente cuando devuelve la bici. Si el alquiler estaba marcado como robo, ese reintegro acompaña la reversión a `RoboRevertido`.
 
-Los mensajes se envían esperando respuesta, ya que el resultado del pago determina cómo continúa el flujo.
+Los mensajes se envían esperando respuesta, ya que el resultado del pago determina cómo sigue el flujo.
 
 ### Mensajes que recibe
 
@@ -719,28 +538,36 @@ El `Cliente` no se comunica directamente con el `ProcesadorPagos`. La Sede es qu
 El `ProcesadorPagos` no conoce la lógica de alquileres. No decide si un alquiler está activo, cerrado, robado o revertido. Únicamente recibe datos de una operación de pago, la persiste localmente y responde si fue aceptada o rechazada. El `alquiler_id`, si aparece en el mensaje, se trata como un identificador externo opaco usado para trazabilidad.
 
 ```rs
-pub struct ProcesadorPagos {
+struct ProcesadorPagos {
     procesador_id: u32,
-    addr: SocketAddr,
+    ip: IpAddr,
+    public_listener: TcpListener,
+    bus_2pc: TcpListener,
+    socket: UdpSocket,
     peers: Vec<SocketAddr>,
-    rol: RolProcesadorPagos,
-    pagos_procesados: Vec<PagoProcesado>,
-    transacciones_en_curso: Vec<TransaccionPago2PC>,
+    liveness: Mutex<HashMap<SocketAddr, InfoNodo>>,
+    rol_actual: Mutex<RolActual>,
+    recibio_ok: Mutex<bool>,
+    tiempos: Tiempos,
+    pagos_procesados: Mutex<Vec<PagoProcesado>>,
+    transacciones_en_curso: Mutex<Vec<TransaccionPago2PC>>,
+    preparados_replica: Mutex<HashMap<String, MsgSedeAProcesadorPagos>>,
+    rechazar_si_monto_supera: Option<f64>,
+    estado_path: String,
 }
 
-pub enum RolProcesadorPagos {
-    Replica,
-    Lider {
-        epoch_lider: u64,
-    },
+enum RolActual {
+    Lider,
+    Candidato,
+    Replica { lider_id: u32 },
 }
 ```
 
-El campo `pagos_procesados` mantiene el historial local de operaciones de pago procesadas por ese nodo. Este historial no reemplaza el estado de las Sedes: solamente representa operaciones de pago que el servicio de pagos aceptó o rechazó.
+El nodo usa tres canales: `public_listener` (TCP) recibe los pedidos de pago de las Sedes, `bus_2pc` (TCP) transporta el commit de dos fases entre procesadores y `socket` (UDP) lleva los mensajes de Bully (heartbeats y elección). `peers` son los demás nodos conocidos y `liveness` registra cuáles están vivos según sus heartbeats.
 
-El campo `peers` contiene las direcciones de otros nodos `ProcesadorPagos` conocidos. Esto permite ejecutar Bully para elegir líder y 2PC para replicar una decisión de pago entre procesadores.
+`rol_actual` arranca según la config y muta a `Lider`, `Candidato` o `Replica { lider_id }` a medida que Bully resuelve la elección. `recibio_ok` recuerda si el nodo recibió un `Ok` durante una elección en curso y `tiempos` agrupa los timeouts configurables.
 
-El campo `transacciones_en_curso` guarda operaciones que están atravesando el commit de dos fases. Si el líder se cae en la mitad, los nodos pueden reconstruir si una transacción estaba preparada, confirmada o abortada.
+`pagos_procesados` es el historial local de operaciones que el servicio aceptó o rechazó, sin reemplazar el estado de las Sedes. `transacciones_en_curso` guarda los 2PC en vuelo para reconstruir si una operación quedó preparada, confirmada o abortada. `preparados_replica` recuerda las operaciones que una réplica preparó y espera resolver con un commit o abort posterior. `rechazar_si_monto_supera` es un umbral opcional para simular rechazos y `estado_path` apunta al snapshot durable.
 
 ### Estado de soporte
 
@@ -771,7 +598,7 @@ pub enum EstadoPago {
 
 pub struct TransaccionPago2PC {
     payment_request_id: String,
-    operacion: TipoOperacionPago,
+    operacion: PagoProcesado,
     participantes: Vec<u32>,
     votos_commit: Vec<u32>,
     votos_abort: Vec<u32>,
@@ -841,54 +668,49 @@ pub enum MsgProcesadorPagosASede {
         payment_request_id: String,
         motivo: String,
     },
+    NoSoyLider {
+        lider_addr: Option<SocketAddr>,
+    },
 }
 ```
 
 `PagoPreAutorizado`: Indica que el cliente puede continuar con el proceso de alquiler.
 
-`PagoAceptado`: Indica que el cobro final o la multa por robo fueron realizados correctamente. Incluye un `pago_id` para que la Sede pueda asociar el pago con la devolución o con el robo confirmado.
+`PagoAceptado`: Indica que el cobro final o la captura del depósito por robo fueron realizados correctamente. Incluye un `pago_id` para que la Sede asocie el pago con la devolución o con el robo confirmado.
 
-`PagoReembolsado`: Indica que se devolvió una penalización cobrada previamente. La Sede origen persiste este resultado como `ReembolsoPenalizacionConfirmado`.
+`PagoReembolsado`: Indica que se devolvió el depósito retenido previamente.
 
-`PagoRechazado`: Indica que la operación fue rechazada. Durante el alquiler esto dispara el rollback del slot reservado. Durante la devolución, la multa o el reembolso, la Sede puede dejar la operación como pendiente si el evento de negocio ya ocurrió.
+`PagoRechazado`: Indica que la operación fue rechazada. Durante el alquiler dispara el rollback del slot reservado. Durante la devolución, la Sede responde con `DevolucionRechazada`.
+
+`NoSoyLider`: La responde un nodo que recibió un pedido sin ser el líder. Incluye, si lo conoce, la dirección del líder actual para que la Sede redirija el pedido.
 
 ### Mensajes entre procesadores
 
+Los procesadores usan dos protocolos sobre canales distintos. Bully viaja por UDP y elige el líder. El commit de dos fases viaja por un bus TCP aparte y replica cada decisión de pago.
+
 ```rs
+// Bully (UDP)
+pub enum MsgProcesador {
+    Heartbeat { procesador_id: u32, es_lider: bool },
+    HeartbeatAck { procesador_id: u32 },
+    Eleccion { procesador_id: u32 },
+    Ok { procesador_id: u32 },
+    Coordinador { lider_id: u32 },
+}
+```
+
+`Heartbeat` y `HeartbeatAck` mantienen la detección de vivos entre nodos. `Eleccion`, `Ok` y `Coordinador` son el núcleo de Bully: un nodo que detecta al líder caído arranca una elección, los nodos de mayor id responden `Ok`, y el mayor que sigue vivo se anuncia con `Coordinador`.
+
+```rs
+// Commit de dos fases (TCP)
 pub enum MsgProcesadorAProcesador {
-    EleccionPago {
-        procesador_id: u32,
-    },
-    RespuestaEleccionPago {
-        procesador_id: u32,
-    },
-    CoordinadorPago {
-        lider_id: u32,
-        epoch_lider: u64,
-    },
-    PrepararPago {
-        payment_request_id: String,
-        pago: PagoProcesado,
-    },
-    VotoPago {
-        payment_request_id: String,
-        voto: Voto2PC,
-    },
-    CommitPago {
-        payment_request_id: String,
-    },
-    AbortPago {
-        payment_request_id: String,
-    },
-    AckDecisionPago {
-        payment_request_id: String,
-    },
-    ConsultarPago {
-        payment_request_id: String,
-    },
-    RespuestaConsultaPago {
-        pago: Option<PagoProcesado>,
-    },
+    PrepararPago { payment_request_id: String, pago: MsgSedeAProcesadorPagos },
+    VotoPago { payment_request_id: String, votante_id: u32, voto: Voto2PC },
+    CommitPago { payment_request_id: String },
+    AbortPago { payment_request_id: String },
+    AckDecisionPago { payment_request_id: String, votante_id: u32 },
+    ConsultarPago { payment_request_id: String },
+    RespuestaConsultaPago { payment_request_id: String, pago: Option<PagoProcesado> },
 }
 
 pub enum Voto2PC {
@@ -897,15 +719,13 @@ pub enum Voto2PC {
 }
 ```
 
-`EleccionPago`, `RespuestaEleccionPago` y `CoordinadorPago` pertenecen al algoritmo Bully utilizado para elegir el líder de pagos. El nodo con mayor prioridad que permanece vivo se anuncia como coordinador.
+`PrepararPago` lleva la operación original de la Sede y pide a cada réplica que la deje preparada. Cada una responde con `VotoPago` identificándose por `votante_id`. Si todos votan `Commit`, el líder manda `CommitPago`, en caso contrario manda `AbortPago`, y cada réplica confirma con `AckDecisionPago`.
 
-`PrepararPago`, `VotoPago`, `CommitPago`, `AbortPago` y `AckDecisionPago` implementan el commit de dos fases. El líder primero pregunta si los participantes pueden persistir la operación. Si todos responden `Commit`, el líder confirma la operación. Si alguno responde `Abort` o no responde dentro del timeout, el líder aborta la transacción.
-
-`ConsultarPago` y `RespuestaConsultaPago` se usan para resolver reintentos idempotentes. Si un nodo recibe un pedido repetido o una Sede contacta a una replica por error, puede consultar el estado de esa operación y devolver la decisión ya tomada.
+`ConsultarPago` y `RespuestaConsultaPago` resuelven reintentos idempotentes. Un nodo que recibe un pedido repetido consulta el estado de esa operación y devuelve la decisión ya tomada.
 
 ### Protocolo de comunicación
 
-La comunicación entre una Sede y el servicio de pagos se realiza por TCP mediante mensajes serializados. La Sede intenta enviar el pedido al líder de pagos conocido. Si el líder no responde, contacta a otro procesador; ese procesador puede informar el líder actual o iniciar una nueva elección Bully si detecta que el coordinador cayó.
+La comunicación entre una Sede y el servicio de pagos se realiza por TCP mediante mensajes serializados. La Sede intenta enviar el pedido al líder de pagos conocido. Si el líder no responde, contacta a otro procesador. Ese procesador puede informar el líder actual o iniciar una nueva elección Bully si detecta que el coordinador cayó.
 
 Cuando el líder recibe una operación nueva, primero verifica si ya existe un `PagoProcesado` con ese `payment_request_id`. Si existe, devuelve la respuesta persistida previamente y no vuelve a ejecutar la operación.
 
@@ -921,21 +741,21 @@ El proceso de alquiler involucra múltiples pasos que deben ejecutarse de forma 
 
 En este sistema no se intenta garantizar atomicidad estricta entre la liberación física de la bicicleta y la persistencia del alquiler activo. En cambio, se utiliza una estrategia de consistencia eventual basada en un comprobante firmado del alquiler.
 
-Antes de liberar la bicicleta, la Sede origen genera una `BiciAlquilada` con un `token_alquiler`. Este token se calcula firmando los datos principales del alquiler con un secreto simétrico compartido entre las Sedes. En la simulación, este secreto puede estar hardcodeado en todas las aplicaciones Sede.
-
-Conceptualmente:
+Antes de liberar la bicicleta, la Sede origen genera una `BiciAlquilada` con un `token_alquiler`. El token es un `PayloadToken` con los datos del alquiler, cifrado y autenticado con ChaCha20-Poly1305 usando un secreto compartido entre todas las Sedes, derivado de la variable de entorno `TOKEN_SECRET`.
 
 ```rs
-token_alquiler = firmar_con_secreto_compartido(
-    alquiler_id,
-    bici_id,
-    cliente_id,
-    sede_origen_id,
-    inicio_ts
-)
+pub struct PayloadToken {
+    bici_id: String,
+    alquiler_id: String,
+    cliente_id: String,
+    sede_origen_id: u32,
+    inicio_ts: u64,
+}
+
+token_alquiler = cifrar_autenticado_chacha20poly1305(PayloadToken, secreto_compartido)
 ```
 
-El token no reemplaza al estado local de la Sede origen, pero permite que cualquier Sede pueda validar localmente que el comprobante fue emitido por una Sede válida y que sus datos no fueron modificados por el Cliente.
+Cualquier Sede puede descifrar el token con el secreto compartido y verificar que los datos los emitió una Sede válida y que el Cliente no los alteró. El token viaja dentro de la `BiciAlquilada` y acompaña a la bici durante todo el alquiler.
 
 ```rs
 pub struct BiciAlquilada {
@@ -958,15 +778,13 @@ Los pasos y sus compensaciones son:
 | 4    | Enviar `ComprobanteAlquilerEmitido` al Cliente                              | Cancelar Slot: `Reservado` → `Disponible` |
 | 5    | Recibir `AckComprobanteAlquiler` del Cliente                                | Cancelar Slot: `Reservado` → `Disponible` |
 | 6    | Confirmar Slot (`send().await`): `Reservado` → `Vacio`                      | —                                         |
-| 7    | Registrar `AlquilerActivo` en la Sede origen y persistir `AlquilerIniciado` | —                                         |
+| 7    | Registrar el `AlquilerActivo` en la Sede origen y persistir el snapshot     | —                                         |
 
 Si el paso 1 falla, porque no hay slots en estado `Disponible`, se responde `AlquilerRechazado` directamente. Si el paso 2 falla, porque el pago fue rechazado o porque ningún nodo de pagos pudo pre-autorizar la operación, se envía `Cancelar` al Slot para volver al estado `Disponible`.
 
-La parte importante de esta saga es que el Cliente recibe el comprobante firmado antes de que la bicicleta sea liberada físicamente. Si la Sede origen se cae luego de confirmar el Slot pero antes de persistir `AlquilerIniciado`, el Cliente ya conserva una `BiciAlquilada` válida con `token_alquiler`.
+La parte importante de esta saga es que el Cliente recibe el comprobante firmado antes de que se confirme el slot. Con esa `BiciAlquilada` válida en mano, puede devolver la bici en cualquier Sede.
 
-Esto permite que la bicicleta pueda ser devuelta en otra Sede aunque el alquiler todavía no exista en el estado persistido de la Sede origen. La Sede destino valida el token localmente usando el secreto compartido. Si el token es válido, acepta la devolución a ciegas, registra la devolución localmente y luego intenta conciliar con la Sede origen.
-
-En el camino normal, la Sede origen también registra el alquiler en `alquileres_activos` y persiste `AlquilerIniciado` en su `log_local`. El token no elimina esa persistencia; solamente evita perder la bicicleta en el caso borde donde la Sede cae entre liberar físicamente la bicicleta y registrar el alquiler activo.
+La Sede destino valida el token localmente con el secreto compartido. Si el token es válido, acepta la devolución, la registra localmente y luego concilia con la Sede origen. En el camino normal la Sede origen también guarda el `AlquilerActivo` en su snapshot, de modo que conoce el alquiler cuando llega la conciliación.
 
 Los pasos 1, 2, 5 y 6 utilizan comunicación esperando respuesta porque la Sede necesita saber el resultado antes de avanzar. El envío del comprobante al Cliente también requiere confirmación, ya que no se libera la bicicleta hasta que el Cliente haya recibido la `BiciAlquilada` firmada.
 
@@ -978,28 +796,20 @@ El proceso de devolución puede ocurrir en la misma Sede donde se inició el alq
 
 El flujo general es:
 
-1. El Cliente envía `DevolverBici { bici, coords }` a la Sede destino.
-2. La Sede destino verifica que el Cliente esté dentro del radio permitido.
-3. La Sede destino valida el `token_alquiler` incluido en la `BiciAlquilada`.
-4. Si el token es inválido, la Sede destino responde `DevolucionRechazada`.
-5. Si el token es válido, la Sede destino busca un Slot en estado `Vacio`.
-6. La Sede destino asegura la bicicleta en el Slot.
-7. La Sede destino calcula el monto proporcional al tiempo de uso usando `inicio_ts`.
-8. La Sede destino intenta cobrar mediante un `ProcesadorPagos`.
-9. La Sede destino registra la devolución localmente.
-10. Si la Sede origen es distinta, la Sede destino le envía `NotificarDevolucion`, incluyendo el `token_alquiler`.
-11. La Sede origen cierra el `AlquilerActivo` si lo encuentra, o reconstruye el alquiler desde el token si no lo tenía persistido.
-12. La Sede origen responde `AckDevolucion`.
+1. El Cliente envía `DevolverBici { bici, coords, dinero }` a la Sede destino.
+2. La Sede destino verifica que el Cliente esté dentro del radio.
+3. Valida el `token_alquiler`. Si es inválido, responde `DevolucionRechazada`.
+4. Calcula el monto por el tiempo de uso a partir de `inicio_ts`. Si supera el saldo del Cliente, responde `DevolucionRechazada`.
+5. Cobra el monto con `CobrarPago` al líder de pagos. Si lo rechazan, responde `DevolucionRechazada`.
+6. Asegura la bici en un Slot `Vacio`. Si no hay ninguno, responde `DevolucionRechazada`.
+7. Registra la `DevolucionRecibida` y, si el alquiler no era un robo local, lo remueve de `alquileres_activos`.
+8. Reintegra el depósito con `ReembolsarPago`. Si el alquiler estaba marcado como robo, lo pasa a `RoboRevertido`.
+9. Persiste el snapshot.
+10. Avisa a la Sede origen con `NotificarDevolucion`, que incluye el `token_alquiler`. Si origen y destino son la misma Sede, lo resuelve localmente.
+11. La Sede origen cierra el `AlquilerActivo` y responde `AckDevolucion`.
+12. La Sede destino responde `DevolucionOk` con la `Bici` y el saldo actualizado.
 
-Si la Sede destino no tiene slots vacíos, responde `DevolucionRechazada`.
-
-Si el `token_alquiler` es inválido, la devolución se rechaza porque la Sede no puede verificar que esos datos hayan sido emitidos por una Sede válida.
-
-Si la bicicleta ya fue asegurada físicamente pero el cobro no pudo confirmarse, la devolución no se pierde: la Sede destino guarda un `PagoPendiente` y reintenta más tarde. Esto es necesario para soportar devoluciones offline o fallas temporales del servicio de pagos.
-
-Si la Sede origen no está disponible, la Sede destino guarda una `NotificacionPendiente` y reintenta más tarde. Cuando finalmente recibe `AckDevolucion`, marca la devolución como conciliada. Si el reintento llega tarde y la Sede origen ya había marcado el alquiler como `RoboConfirmado`, la Sede origen valida el token, revierte el robo y solicita el reembolso de la penalización cobrada.
-
-Si la Sede origen recibe la notificación pero no encuentra el alquiler activo, valida el `token_alquiler`. Si el token es válido, reconstruye el alquiler mínimo, persiste `AlquilerReconstruidoDesdeToken`, luego persiste `AlquilerCerrado` y acepta la devolución. Esto cubre el caso donde la Sede origen se cayó entre liberar la bicicleta y persistir el alquiler activo.
+Si la Sede origen no está disponible, la Sede destino encola una `NotificacionPendiente` y la reintenta al reconectar. Cuando recibe el `AckDevolucion`, marca la devolución como conciliada. Si ese aviso llega tarde y la Sede origen ya había marcado el alquiler como `RoboConfirmado`, lo pasa a `RoboRevertido`.
 
 ---
 
@@ -1007,36 +817,26 @@ Si la Sede origen recibe la notificación pero no encuentra el alquiler activo, 
 
 El sistema no mantiene un registro global centralizado de alquileres activos. En su lugar, cada Sede persiste localmente la parte del estado que le corresponde.
 
-En el camino normal, cuando una bicicleta se alquila en una Sede, esa Sede registra un `AlquilerActivo` en su estado local y persiste un evento `AlquilerIniciado` en su `log_local`.
+En el camino normal, cuando una bicicleta se alquila en una Sede, esa Sede guarda un `AlquilerActivo` en su estado local y lo persiste en su snapshot. Antes de confirmar el slot emite la `BiciAlquilada` con `token_alquiler`, así el Cliente tiene un comprobante válido aunque después haya una caída.
 
-Sin embargo, el diseño acepta que puede existir una ventana de inconsistencia: la Sede origen puede liberar físicamente la bicicleta y caerse antes de persistir `AlquilerIniciado`. Para cubrir ese caso, antes de liberar la bicicleta la Sede emite una `BiciAlquilada` con `token_alquiler`. Si más adelante la Sede origen recibe una devolución de un alquiler que no encuentra en su estado local, puede validar el token y reconstruir el alquiler mínimo mediante `AlquilerReconstruidoDesdeToken`.
+Cuando la bicicleta se devuelve, hay dos casos:
 
-Cuando la bicicleta se devuelve, pueden ocurrir dos casos:
+* Si se devuelve en la misma Sede que originó el alquiler, esa Sede lo cierra localmente.
+* Si se devuelve en otra Sede, la Sede destino procesa la devolución, cobra y luego avisa a la Sede origen con `NotificarDevolucion`.
 
-* Si se devuelve en la misma Sede donde se originó el alquiler, la Sede puede cerrar el alquiler localmente.
-* Si se devuelve en otra Sede, la Sede destino procesa la devolución, cobra o deja el cobro pendiente, y luego notifica a la Sede origen mediante `NotificarDevolucion`.
+La Sede origen es quien marca como cerrado el alquiler. La Sede destino conserva la `NotificacionPendiente` hasta recibir `AckDevolucion`.
 
-La Sede origen es quien marca como cerrado el alquiler activo. La Sede destino, por su parte, conserva la devolución como pendiente hasta recibir `AckDevolucion`.
-
-La Sede origen no hace un pull activo de información ante un alquiler vencido. Es decir, no consulta a todas las sedes para preguntar si recibieron la bicicleta. En cambio, usa un `deadline_devolucion_ts`: si pasado ese tiempo no recibió `NotificarDevolucion`, marca el alquiler como `RoboConfirmado`, persiste `RoboConfirmado` en su `log_local` y cobra una penalización al Cliente mediante `CobrarPago` contra el servicio de pagos.
-
-Si después de confirmar el robo llega una `NotificarDevolucion` tardía desde la Sede destino, la Sede origen no la descarta automáticamente. Primero valida el `token_alquiler`. Si el token es válido, interpreta que la bicicleta no fue robada sino que la notificación llegó tarde. Entonces persiste `RoboRevertidoPorDevolucionTardia`, cierra el alquiler, responde `AckDevolucion` y solicita `ReembolsarPago` por la penalización cobrada previamente.
+La Sede origen no hace un pull activo ante un alquiler vencido. Al emitir el comprobante programa una verificación a los 60 segundos: si el alquiler sigue `Activo`, lo marca `RoboConfirmado` y captura el depósito como multa con un `CobrarPago`. Si después llega una `NotificarDevolucion`, interpreta que la bici apareció tarde y pasa el alquiler a `RoboRevertido`.
 
 ### Casos borde
 
-Si la Sede destino recibe una bicicleta y se cae antes de notificar a la Sede origen, al reiniciar reconstruye desde su `log_local` que tiene una `NotificacionPendiente` y vuelve a intentar el envío.
+Si la Sede destino recibe una bicicleta y la Sede origen está caída, conserva la `NotificacionPendiente` en su snapshot y la reintenta al reconectar. Cuando finalmente recibe el `AckDevolucion`, marca la devolución como conciliada.
 
-Si la Sede origen está caída al momento de la devolución, la Sede destino conserva la notificación como pendiente y reintenta periódicamente.
+Si la respuesta del `ProcesadorPagos` se pierde, la Sede reintenta el pedido con el mismo `payment_request_id`. Si el pago ya había sido procesado, el servicio devuelve la respuesta ya persistida sin ejecutar un nuevo cobro o reembolso.
 
-Si la notificación pendiente llega después del `deadline_devolucion_ts`, la Sede origen puede haber marcado el alquiler como `RoboConfirmado` y cobrado la multa. En ese caso, si la notificación tardía trae un token válido, se revierte el robo y se reembolsa la penalización.
+Si una Sede cae, las demás continúan operando con su estado local y con la última información en `sedes_conocidas`, sin elección entre Sedes. Cuando la Sede caída vuelve, retoma los heartbeats y procesa sus notificaciones pendientes.
 
-Si el `ProcesadorPagos` no responde, la Sede conserva un `PagoPendiente` y reintenta más tarde usando el mismo `payment_request_id`.
-
-Si la respuesta del `ProcesadorPagos` se pierde, la Sede reintenta el pedido con el mismo `payment_request_id`. Si el pago ya había sido procesado, el servicio de pagos devuelve la respuesta previamente persistida sin ejecutar un nuevo cobro o reembolso.
-
-Si una Sede cae, no se ejecuta ninguna elección entre Sedes. Las demás continúan operando con su estado local y con la última información disponible en `sedes_conocidas`. Cuando la Sede caída vuelve, retoma los heartbeats y procesa sus pendientes locales.
-
-Si el líder de `ProcesadorPagos` cae, los procesadores ejecutan Bully para elegir un nuevo líder. Las operaciones de pago se resuelven mediante 2PC para evitar que un cobro, una multa o un reembolso quede confirmado en un nodo y perdido en otro.
+Si el líder de `ProcesadorPagos` cae, los procesadores ejecutan Bully para elegir uno nuevo. Las operaciones de pago se resuelven con 2PC para que un cobro o un reembolso no quede confirmado en un nodo y perdido en otro.
 
 ---
 
@@ -1044,7 +844,7 @@ Si el líder de `ProcesadorPagos` cae, los procesadores ejecutan Bully para eleg
 
 Esta sección agrupa estructuras de datos que no representan procesos ni actores propios, pero que son compartidas entre varias entidades del sistema o viajan como payload dentro de los mensajes.
 
-Los tipos internos propios de la Sede, como `AlquilerActivo`, `DevolucionRecibida`, `PagoPendiente`, `NotificacionPendiente` y `EventoSede`, se describen dentro de la sección `Sede`, ya que forman parte de su estado local.
+Los tipos internos propios de la Sede, como `AlquilerActivo`, `DevolucionRecibida`, `PagoPendiente` y `NotificacionPendiente`, se describen dentro de la sección `Sede`, ya que forman parte de su estado local.
 
 ### BiciAlquilada
 
@@ -1063,15 +863,16 @@ pub struct BiciAlquilada {
 
 El campo `bici_id` identifica la bicicleta física. El campo `alquiler_id` identifica el alquiler activo. El campo `cliente_id` permite asociar el cobro con el usuario correspondiente. El campo `sede_origen_id` indica qué Sede debe ser notificada cuando la bicicleta sea devuelta. El campo `inicio_ts` permite que la Sede destino calcule el monto proporcional al tiempo de uso sin depender de un registro global centralizado.
 
-El campo `token_alquiler` es la firma generada por la Sede origen usando un secreto compartido entre Sedes. Permite que cualquier Sede valide que los datos del alquiler fueron emitidos por una Sede válida y que no fueron inventados ni modificados por el Cliente.
+El campo `token_alquiler` es el token cifrado y autenticado que genera la Sede origen con el secreto compartido. Permite que cualquier Sede valide que los datos del alquiler los emitió una Sede válida y que el Cliente no los inventó ni modificó.
 
 ### SedeInfo
 
 ```rs
 pub struct SedeInfo {
     sede_id: u32,
-    addr: SocketAddr,
     coords: (f64, f64),
+    public_addr: String,
+    private_addr: String,
     slots_vacios: u8,
     slots_disponibles: u8,
     conectada: bool,
@@ -1079,11 +880,11 @@ pub struct SedeInfo {
 }
 ```
 
-El campo `slots_vacios` indica cuántos slots no tienen bicicleta y pueden recibir devoluciones. El campo `slots_disponibles` indica cuántos slots tienen una bicicleta lista para alquilar.
+`public_addr` es la dirección TCP donde la Sede atiende a los clientes y `private_addr` la que usa para la comunicación entre sedes. Los campos `slots_vacios` y `slots_disponibles` indican cuántos slots pueden recibir devoluciones y cuántos tienen una bici lista para alquilar.
 
 Ambos valores se calculan a partir del último estado conocido de los slots de la Sede, no se toman como fuente de verdad independiente.
 
-El campo `ultimo_update_ts` permite a los clientes y sedes saber qué tan reciente es la información sobre una Sede, especialmente relevante cuando se opera con datos de caché.
+El campo `ultimo_update_ts` permite a clientes y sedes saber qué tan reciente es la información sobre una Sede.
 
 El campo `conectada` refleja si la Sede estaba accesible al momento del último heartbeat recibido, permitiendo al Cliente mostrar este estado en la aplicación.
 
@@ -1106,25 +907,22 @@ sequenceDiagram
     participant Slot
     participant ProcesadorPagos
 
-    Cliente->>Sede: SolicitarBici(cliente_id, coords)
-    Sede->>Sede: Verifica que cliente esta dentro del radio
+    Cliente->>Sede: SolicitarBici(cliente_id, coords, dinero)
+    Sede->>Sede: Verifica radio y saldo del cliente
     Sede->>Slot: Reservar [send await]
-    Slot-->>Sede: OK - EstadoSlot Reservado
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
+    Slot-->>Sede: Reservada(bici_id)
 
     Sede->>ProcesadorPagos: PreAutorizarPago(payment_request_id, cliente_id, monto_seguridad) [send await]
     ProcesadorPagos-->>Sede: PagoPreAutorizado(payment_request_id, pago_id)
 
     Sede->>Sede: Genera alquiler_id, inicio_ts y token_alquiler
-    Sede->>Sede: Persiste TokenAlquilerEmitido en log_local
-    Sede-->>Cliente: ComprobanteAlquilerEmitido(BiciAlquilada con token)
+    Sede->>Sede: Registra AlquilerActivo y persiste snapshot
+    Sede-->>Cliente: ComprobanteAlquilerEmitido(BiciAlquilada con token, dinero)
     Cliente-->>Sede: AckComprobanteAlquiler(alquiler_id)
 
     Sede->>Slot: Confirmar [send await]
-    Slot-->>Sede: OK - EstadoSlot Vacio
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
-    Sede->>Sede: Registra AlquilerActivo
-    Sede->>Sede: Persiste AlquilerIniciado en log_local
+    Slot-->>Sede: true - EstadoSlot Vacio
+    Sede->>Sede: Persiste snapshot
     Sede-->>Cliente: AlquilerConfirmado(BiciAlquilada)
 ```
 
@@ -1192,17 +990,15 @@ sequenceDiagram
     participant Slot
     participant ProcesadorPagos
 
-    Cliente->>Sede: SolicitarBici(cliente_id, coords)
-    Sede->>Sede: Verifica que cliente esta dentro del radio
+    Cliente->>Sede: SolicitarBici(cliente_id, coords, dinero)
+    Sede->>Sede: Verifica radio y saldo del cliente
     Sede->>Slot: Reservar [send await]
-    Slot-->>Sede: OK - EstadoSlot Reservado
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
+    Slot-->>Sede: Reservada(bici_id)
     Sede->>ProcesadorPagos: PreAutorizarPago(payment_request_id, cliente_id, monto_seguridad) [send await]
     ProcesadorPagos-->>Sede: PagoRechazado(payment_request_id, motivo)
     Note over Sede: Rollback - libera el slot reservado
     Sede->>Slot: Cancelar [send await]
-    Slot-->>Sede: OK - EstadoSlot Disponible
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
+    Slot-->>Sede: true - EstadoSlot Disponible
     Sede-->>Cliente: AlquilerRechazado { motivo: "pago no autorizado" }
 ```
 
@@ -1220,13 +1016,12 @@ sequenceDiagram
     participant Slot
     participant ProcesadorPagos
 
-    ClienteA->>Sede: SolicitarBici(A, coords)
-    ClienteB->>Sede: SolicitarBici(B, coords)
+    ClienteA->>Sede: SolicitarBici(A, coords, dinero)
+    ClienteB->>Sede: SolicitarBici(B, coords, dinero)
 
     Note over Sede: La Sede procesa las solicitudes segun su mailbox
     Sede->>Slot: Reservar para Cliente A [send await]
-    Slot-->>Sede: OK - EstadoSlot Reservado
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
+    Slot-->>Sede: Reservada(bici_id)
 
     Sede->>Sede: Procesa solicitud de Cliente B
     Sede->>Sede: Busca slot Disponible - el unico esta Reservado
@@ -1237,15 +1032,13 @@ sequenceDiagram
     ProcesadorPagos-->>Sede: PagoPreAutorizado(payment_request_id, pago_id)
 
     Sede->>Sede: Genera alquiler_id, inicio_ts y token_alquiler
-    Sede->>Sede: Persiste TokenAlquilerEmitido en log_local
-    Sede-->>ClienteA: ComprobanteAlquilerEmitido(BiciAlquilada con token)
+    Sede->>Sede: Registra AlquilerActivo y persiste snapshot
+    Sede-->>ClienteA: ComprobanteAlquilerEmitido(BiciAlquilada con token, dinero)
     ClienteA-->>Sede: AckComprobanteAlquiler(alquiler_id)
 
     Sede->>Slot: Confirmar [send await]
-    Slot-->>Sede: OK - EstadoSlot Vacio
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
-    Sede->>Sede: Registra AlquilerActivo
-    Sede->>Sede: Persiste AlquilerIniciado en log_local
+    Slot-->>Sede: true - EstadoSlot Vacio
+    Sede->>Sede: Persiste snapshot
     Sede-->>ClienteA: AlquilerConfirmado(BiciAlquilada)
 ```
 
@@ -1262,46 +1055,36 @@ sequenceDiagram
     participant Slot
     participant ProcesadorPagos
 
-    Cliente->>Sede: DevolverBici(BiciAlquilada con token, coords)
-    Note over Sede: EstadoRed Desconectado
-    Sede->>Sede: Verifica que cliente esta dentro del radio
-    Sede->>Sede: Valida token_alquiler con secreto compartido
-    Sede->>Sede: Busca slot en estado Vacio
-    Sede->>Slot: AsegurarBici(bici_id) [send await]
-    Slot-->>Sede: OK - EstadoSlot Disponible
-    Sede->>Sede: Persiste EstadoSlotsActualizado en log_local
+    Cliente->>Sede: DevolverBici(BiciAlquilada con token, coords, dinero)
+    Note over Sede: offline = true
+    Sede->>Sede: Verifica radio y valida token_alquiler
     Sede->>Sede: Calcula monto segun inicio_ts y fin_ts
-    Sede->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, monto_final) [timeout]
-
-    alt ProcesadorPagos responde OK
-        ProcesadorPagos-->>Sede: PagoAceptado(payment_request_id, pago_id)
-        Sede->>Sede: Persiste PagoConfirmado en log_local
-    else ProcesadorPagos no responde
-        Sede->>Sede: Persiste PagoPendienteRegistrado en log_local
-    end
-
-    Sede->>Sede: Persiste DevolucionRecibida en log_local
-    Sede->>Sede: Guarda NotificacionPendiente hacia sede origen
-    Sede-->>Cliente: DevolucionOk(monto, duracion_min)
-    Note over Sede: Al reconectarse reintenta pagos y notificaciones pendientes
+    Sede->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, monto_final)
+    ProcesadorPagos-->>Sede: PagoAceptado(payment_request_id, pago_id)
+    Sede->>Slot: AsegurarBici(bici_id) [send await]
+    Slot-->>Sede: true - EstadoSlot Disponible
+    Sede->>Sede: Registra DevolucionRecibida
+    Sede->>ProcesadorPagos: ReembolsarPago (reintegra el deposito)
+    Sede->>Sede: Encola NotificacionPendiente hacia sede origen y persiste snapshot
+    Sede-->>Cliente: DevolucionOk(Bici, saldo)
+    Note over Sede: Al reconectarse reintenta las notificaciones pendientes
 ```
 
 ---
 
-### 8. Cliente solicita sedes sin conectividad — fallback a caché
+### 8. Cliente pide sedes cercanas
 
-El cliente no puede contactar ninguna sede. Usa su caché local para mostrar la última información disponible, indicando que puede estar desactualizada.
+El cliente conectado a una Sede le pide la información de las sedes cercanas. La Sede responde con lo que conoce de sí misma y de sus vecinas, y el cliente la guarda en `sedes_conocidas` y la muestra ordenada por distancia.
 
 ```mermaid
 sequenceDiagram
     participant Cliente
     participant Sede
 
-    Cliente->>Sede: PedirSedes { coords } [timeout: 500ms]
-    Note over Sede: Sin respuesta — sede inalcanzable o cliente sin señal
-    Cliente->>Cliente: Timeout alcanzado
-    Note over Cliente: Fallback a sedes_cacheadas local
-    Cliente-->>Cliente: Muestra sedes conocidas desde caché
+    Cliente->>Sede: PedirSedes(coords)
+    Sede->>Sede: Filtra sedes_conocidas dentro del radio y agrega la propia
+    Sede-->>Cliente: Vec<SedeInfo>
+    Cliente->>Cliente: Guarda en sedes_conocidas y las muestra por distancia
 ```
 
 ---
@@ -1318,24 +1101,20 @@ sequenceDiagram
     participant ProcesadorPagos
     participant SedeOrigen as Sede Origen
 
-    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords)
-    SedeDestino->>SedeDestino: Verifica que cliente esta dentro del radio
-    SedeDestino->>SedeDestino: Valida token_alquiler con secreto compartido
-    SedeDestino->>SedeDestino: Busca slot en estado Vacio
-    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
-    Slot-->>SedeDestino: OK - EstadoSlot Disponible
-    SedeDestino->>SedeDestino: Persiste EstadoSlotsActualizado en log_local
+    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords, dinero)
+    SedeDestino->>SedeDestino: Verifica radio y valida token_alquiler
     SedeDestino->>SedeDestino: Calcula monto segun inicio_ts y fin_ts
     SedeDestino->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, monto_final) [send await]
     ProcesadorPagos-->>SedeDestino: PagoAceptado(payment_request_id, pago_id)
-    SedeDestino->>SedeDestino: Persiste PagoConfirmado en log_local
-    SedeDestino->>SedeDestino: Persiste DevolucionRecibida en log_local
+    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
+    Slot-->>SedeDestino: true - EstadoSlot Disponible
+    SedeDestino->>SedeDestino: Registra DevolucionRecibida
+    SedeDestino->>ProcesadorPagos: ReembolsarPago (reintegra el deposito)
+    SedeDestino->>SedeDestino: Persiste snapshot
     SedeDestino->>SedeOrigen: NotificarDevolucion(alquiler_id, bici_id, monto, pago_id, token_alquiler)
-    SedeOrigen->>SedeOrigen: Busca alquiler_id en alquileres_activos
-    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste AlquilerCerrado
+    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste snapshot
     SedeOrigen-->>SedeDestino: AckDevolucion(alquiler_id)
-    SedeDestino->>SedeDestino: Persiste NotificacionOrigenConfirmada
-    SedeDestino-->>Cliente: DevolucionOk(monto, duracion_min)
+    SedeDestino-->>Cliente: DevolucionOk(Bici, saldo)
 ```
 
 ---
@@ -1352,166 +1131,89 @@ sequenceDiagram
     participant ProcesadorPagos
     participant SedeOrigen as Sede Origen
 
-    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords)
-    SedeDestino->>SedeDestino: Verifica que cliente esta dentro del radio
-    SedeDestino->>SedeDestino: Valida token_alquiler con secreto compartido
-    SedeDestino->>SedeDestino: Busca slot en estado Vacio
-    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
-    Slot-->>SedeDestino: OK - EstadoSlot Disponible
-    SedeDestino->>SedeDestino: Persiste EstadoSlotsActualizado en log_local
+    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords, dinero)
+    SedeDestino->>SedeDestino: Verifica radio y valida token_alquiler
     SedeDestino->>SedeDestino: Calcula monto segun inicio_ts y fin_ts
     SedeDestino->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, monto_final) [send await]
     ProcesadorPagos-->>SedeDestino: PagoAceptado(payment_request_id, pago_id)
-    SedeDestino->>SedeDestino: Persiste PagoConfirmado en log_local
-    SedeDestino->>SedeDestino: Persiste DevolucionRecibida en log_local
+    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
+    Slot-->>SedeDestino: true - EstadoSlot Disponible
+    SedeDestino->>SedeDestino: Registra DevolucionRecibida
+    SedeDestino->>ProcesadorPagos: ReembolsarPago (reintegra el deposito)
     SedeDestino->>SedeOrigen: NotificarDevolucion(alquiler_id, bici_id, monto, pago_id, token_alquiler)
     Note over SedeOrigen: No responde - caida o sin conectividad
-    SedeDestino->>SedeDestino: Guarda NotificacionPendiente en log_local
-    SedeDestino-->>Cliente: DevolucionOk(monto, duracion_min)
+    SedeDestino->>SedeDestino: Encola NotificacionPendiente y persiste snapshot
+    SedeDestino-->>Cliente: DevolucionOk(Bici, saldo)
 
-    Note over SedeDestino,SedeOrigen: Mas tarde, cuando recupera conectividad
-    SedeDestino->>SedeOrigen: Reintenta NotificarDevolucion(alquiler_id, bici_id, monto, pago_id, token_alquiler)
-    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste AlquilerCerrado
+    Note over SedeDestino,SedeOrigen: Mas tarde, al reconectar (flush)
+    SedeDestino->>SedeOrigen: Reintenta NotificarDevolucion(...)
+    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste snapshot
     SedeOrigen-->>SedeDestino: AckDevolucion(alquiler_id)
-    SedeDestino->>SedeDestino: Persiste NotificacionOrigenConfirmada
+    SedeDestino->>SedeDestino: Marca la notificacion como conciliada
 ```
 
 ---
 
-### 11. Devolución con pago pendiente — caída de ProcesadorPagos
+### 11. Sede origen no recibe la notificación a tiempo — robo confirmado
 
-La Sede destino puede recibir físicamente la bicicleta aunque no logre confirmar el cobro en ese momento. Primero valida el `token_alquiler`; si los nodos `ProcesadorPagos` no responden, persiste un `PagoPendiente` en su `log_local` y reintenta más adelante usando el mismo `payment_request_id`.
-
-```mermaid
-sequenceDiagram
-    participant Cliente
-    participant SedeDestino as Sede Destino
-    participant Slot
-    participant ProcesadorPagos
-    participant SedeOrigen as Sede Origen
-
-    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords)
-    SedeDestino->>SedeDestino: Verifica que cliente esta dentro del radio
-    SedeDestino->>SedeDestino: Valida token_alquiler con secreto compartido
-    SedeDestino->>SedeDestino: Busca slot en estado Vacio
-    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
-    Slot-->>SedeDestino: OK - EstadoSlot Disponible
-    SedeDestino->>SedeDestino: Persiste EstadoSlotsActualizado en log_local
-    SedeDestino->>SedeDestino: Calcula monto segun inicio_ts y fin_ts
-    SedeDestino->>SedeDestino: Genera payment_request_id
-    SedeDestino->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, monto_final) [timeout]
-    Note over ProcesadorPagos: No responde - caido o sin conectividad
-    SedeDestino->>SedeDestino: Persiste PagoPendienteRegistrado en log_local
-    SedeDestino->>SedeDestino: Registra DevolucionRecibida con estado_pago Pendiente
-    SedeDestino->>SedeDestino: Guarda NotificacionPendiente hacia sede origen
-    SedeDestino-->>Cliente: DevolucionOk(monto, duracion_min)
-    Note over Cliente,SedeDestino: La bici queda devuelta y el cobro pendiente de conciliacion
-
-    Note over SedeDestino,ProcesadorPagos: Mas tarde, cuando recupera conectividad
-    SedeDestino->>ProcesadorPagos: Reintenta CobrarPago(mismo payment_request_id, alquiler_id, cliente_id, monto_final)
-    ProcesadorPagos-->>SedeDestino: PagoAceptado(payment_request_id, pago_id)
-    SedeDestino->>SedeDestino: Persiste PagoConfirmado en log_local
-    SedeDestino->>SedeDestino: Actualiza DevolucionRecibida con estado_pago Confirmado
-
-    SedeDestino->>SedeOrigen: NotificarDevolucion(alquiler_id, bici_id, monto, pago_id, token_alquiler)
-    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste AlquilerCerrado
-    SedeOrigen-->>SedeDestino: AckDevolucion(alquiler_id)
-    SedeDestino->>SedeDestino: Persiste NotificacionOrigenConfirmada
-```
-
----
-
-### 12. Sede origen no recibe la notificación a tiempo — robo confirmado y multa
-
-La Sede origen tiene un alquiler activo que superó el tiempo máximo esperado. Como no recibió `NotificarDevolucion` dentro del plazo, no consulta al resto de las sedes. Directamente marca el alquiler como robo confirmado y cobra una penalización al cliente.
+La Sede origen tiene un alquiler que sigue `Activo` pasados 60 segundos del comprobante. No consulta al resto de las sedes: marca el alquiler como `RoboConfirmado` y captura el depósito retenido como multa.
 
 ```mermaid
 sequenceDiagram
     participant SedeOrigen as Sede Origen
     participant ProcesadorPagos
 
-    Note over SedeOrigen: AlquilerActivo supera deadline_devolucion_ts
-    SedeOrigen->>SedeOrigen: Marca alquiler como Sospechoso
-    SedeOrigen->>SedeOrigen: Persiste AlquilerMarcadoSospechoso
+    Note over SedeOrigen: Pasaron 60s y el alquiler sigue Activo
     SedeOrigen->>SedeOrigen: Marca alquiler como RoboConfirmado
-    SedeOrigen->>SedeOrigen: Persiste RoboConfirmado(monto_multa)
-    SedeOrigen->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, multa_robo)
+    SedeOrigen->>ProcesadorPagos: CobrarPago(payment_request_id, alquiler_id, cliente_id, deposito)
     ProcesadorPagos-->>SedeOrigen: PagoAceptado(payment_request_id, pago_id)
-    SedeOrigen->>SedeOrigen: Persiste MultaRoboCobrada
+    SedeOrigen->>SedeOrigen: Guarda pago_multa_id y persiste snapshot
 ```
 
 ---
 
-### 13. Notificación tardía — la bici no fue robada y se reembolsa la penalización
+### 12. Notificación tardía — la bici no fue robada
 
-La Sede destino había recibido la bicicleta, pero no logró avisarle a la Sede origen antes del timeout. Cuando finalmente llega la notificación, la Sede origen valida el token, revierte el robo y solicita el reembolso de la multa cobrada.
+La Sede destino recibió la bicicleta y ya reintegró el depósito al cliente, pero no había logrado avisarle a la Sede origen, que entretanto marcó el alquiler como robo. Cuando llega la notificación, la Sede origen entiende que la bici apareció y revierte el robo.
 
 ```mermaid
 sequenceDiagram
     participant SedeDestino as Sede Destino
     participant SedeOrigen as Sede Origen
-    participant ProcesadorPagos
 
-    Note over SedeOrigen: El alquiler ya estaba como RoboConfirmado
+    Note over SedeOrigen: El alquiler estaba como RoboConfirmado
+    Note over SedeDestino: Ya cobró la devolución y reintegró el depósito
     SedeDestino->>SedeOrigen: NotificarDevolucion(alquiler_id, bici_id, monto, pago_id, token_alquiler)
-    SedeOrigen->>SedeOrigen: Valida token_alquiler con secreto compartido
-    SedeOrigen->>SedeOrigen: Persiste RoboRevertidoPorDevolucionTardia
-    SedeOrigen->>SedeOrigen: Cierra AlquilerActivo y persiste AlquilerCerrado
+    SedeOrigen->>SedeOrigen: Pasa el alquiler a RoboRevertido y persiste snapshot
     SedeOrigen-->>SedeDestino: AckDevolucion(alquiler_id)
-    SedeDestino->>SedeDestino: Persiste NotificacionOrigenConfirmada
-    SedeOrigen->>ProcesadorPagos: ReembolsarPago(payment_request_id, alquiler_id, cliente_id, pago_multa_id, monto_multa)
-    ProcesadorPagos-->>SedeOrigen: PagoReembolsado(payment_request_id, pago_id)
-    SedeOrigen->>SedeOrigen: Persiste ReembolsoPenalizacionConfirmado
+    SedeDestino->>SedeDestino: Marca la notificacion como conciliada
 ```
 
 ---
 
-### 14. Alquiler con caída entre liberar la bicicleta y registrar el alquiler
+### 13. Devolución cuando la Sede origen perdió el registro del alquiler
 
-Este caso cubre el borde donde la Sede origen libera físicamente la bicicleta pero se cae antes de persistir `AlquilerIniciado`. La devolución sigue siendo posible porque el Cliente ya recibió una `BiciAlquilada` con `token_alquiler`.
+El comprobante firmado permite devolver la bici aunque la Sede origen ya no tenga el alquiler en su estado, por ejemplo tras una caída. El destino valida el token y acepta, y el origen responde el ack aunque no encuentre el alquiler.
 
 ```mermaid
 sequenceDiagram
     participant Cliente
-    participant SedeOrigen as Sede Origen
-    participant Slot
     participant SedeDestino as Sede Destino
+    participant Slot
     participant ProcesadorPagos
+    participant SedeOrigen as Sede Origen
 
-    Cliente->>SedeOrigen: SolicitarBici(cliente_id, coords)
-    SedeOrigen->>SedeOrigen: Verifica que cliente esta dentro del radio
-    SedeOrigen->>Slot: Reservar [send await]
-    Slot-->>SedeOrigen: OK - EstadoSlot Reservado
-    SedeOrigen->>SedeOrigen: Persiste EstadoSlotsActualizado en log_local
-
-    SedeOrigen->>ProcesadorPagos: PreAutorizarPago(payment_request_id, cliente_id, monto_seguridad) [send await]
-    ProcesadorPagos-->>SedeOrigen: PagoPreAutorizado(payment_request_id, pago_id)
-
-    SedeOrigen->>SedeOrigen: Genera alquiler_id, inicio_ts y token_alquiler
-    SedeOrigen->>SedeOrigen: Persiste TokenAlquilerEmitido
-    SedeOrigen-->>Cliente: ComprobanteAlquilerEmitido(BiciAlquilada con token)
-    Cliente-->>SedeOrigen: AckComprobanteAlquiler(alquiler_id)
-
-    SedeOrigen->>Slot: Confirmar [send await]
-    Slot-->>SedeOrigen: OK - EstadoSlot Vacio
-    SedeOrigen->>SedeOrigen: Persiste EstadoSlotsActualizado en log_local
-
-    Note over SedeOrigen: Cae antes de persistir AlquilerIniciado
-
-    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords)
-    SedeDestino->>SedeDestino: Valida token_alquiler con secreto compartido
-    SedeDestino->>SedeDestino: Busca slot Vacio
-    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
-    Slot-->>SedeDestino: OK - EstadoSlot Disponible
+    Cliente->>SedeDestino: DevolverBici(BiciAlquilada con token, coords, dinero)
+    SedeDestino->>SedeDestino: Verifica radio y valida token_alquiler
     SedeDestino->>SedeDestino: Calcula monto segun inicio_ts y fin_ts
-    SedeDestino->>SedeDestino: Persiste DevolucionRecibida
+    SedeDestino->>ProcesadorPagos: CobrarPago(...) [send await]
+    ProcesadorPagos-->>SedeDestino: PagoAceptado(payment_request_id, pago_id)
+    SedeDestino->>Slot: AsegurarBici(bici_id) [send await]
+    Slot-->>SedeDestino: true - EstadoSlot Disponible
+    SedeDestino->>SedeDestino: Registra DevolucionRecibida y persiste snapshot
 
     SedeDestino->>SedeOrigen: NotificarDevolucion(..., token_alquiler)
-    SedeOrigen->>SedeOrigen: No encuentra AlquilerActivo
-    SedeOrigen->>SedeOrigen: Valida token_alquiler
-    SedeOrigen->>SedeOrigen: Persiste AlquilerReconstruidoDesdeToken
-    SedeOrigen->>SedeOrigen: Persiste AlquilerCerrado
+    SedeOrigen->>SedeOrigen: No encuentra el AlquilerActivo
     SedeOrigen-->>SedeDestino: AckDevolucion(alquiler_id)
-    SedeDestino->>SedeDestino: Persiste NotificacionOrigenConfirmada
-    SedeDestino-->>Cliente: DevolucionOk(monto, duracion_min)
+    SedeDestino-->>Cliente: DevolucionOk(Bici, saldo)
 ```
