@@ -164,6 +164,11 @@ impl Cliente {
         if let Some(json) = respuesta {
             match serde_json::from_str::<Vec<SedeInfo>>(&json) {
                 Ok(sedes) => {
+                    if sedes.is_empty() {
+                        println!("[cliente] La sede esta offline y fuera de rango");
+                        Cliente::print_sedes(&self.sedes_conocidas, coords);
+                        return Ok(());
+                    }
                     self.sedes_conocidas = sedes;
                 }
                 Err(e) => {

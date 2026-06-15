@@ -640,6 +640,11 @@ impl Handler<PedirSedes> for Sede {
     type Result = MessageResult<PedirSedes>;
 
     fn handle(&mut self, msg: PedirSedes, _ctx: &mut Self::Context) -> Self::Result {
+        if *self.offline.lock().unwrap_or_else(|e| e.into_inner()) && !self.cliente_en_rango(msg.coords) {
+            log!("[sede] PedirSedes rechazado: sede offline y cliente fuera de rango");
+            return MessageResult(vec![]);
+        }
+
         let sedes_cercanas: Vec<SedeInfo> = self.sedes_conocidas
             .iter()
             .cloned()
