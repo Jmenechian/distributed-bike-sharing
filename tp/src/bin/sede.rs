@@ -641,9 +641,9 @@ impl Handler<Handshake> for Sede {
 
     fn handle(&mut self, msg: Handshake, _ctx: &mut Self::Context) -> Self::Result {
         if *self.offline.lock().unwrap_or_else(|e| e.into_inner()) && !self.cliente_en_rango(msg.coords) {
-            MessageResult(RespuestaHandshake::Rechazado("Sede offline — fuera de rango".into()))
+            MessageResult(RespuestaHandshake::Rechazado("Sede offline y fuera de rango".parse().unwrap()))
         } else {
-            MessageResult(RespuestaHandshake::Aceptado)
+            MessageResult(RespuestaHandshake::Aceptado(self.coords))
         }
     }
 }
@@ -2404,7 +2404,7 @@ fn cargar_token_secret() -> Option<[u8; 32]> {
     let token_secret_raw = match env::var("TOKEN_SECRET") {
         Ok(raw) => raw,
         Err(_) => {
-            eprintln!("Falta la variable de entorno TOKEN_SECRET — no se puede iniciar la sede");
+            eprintln!("Falta la variable de entorno TOKEN_SECRET no se puede iniciar la sede");
             return None;
         }
     };

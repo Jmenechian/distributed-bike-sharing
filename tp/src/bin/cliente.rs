@@ -10,7 +10,7 @@ use std::io::BufReader as StdBufReader;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use matenmutex::common::calcular_distancia;
+use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA};
 use matenmutex::messages::sede_sede::SedeInfo;
 use std::io::Write;
 
@@ -44,6 +44,8 @@ pub struct Cliente {
     bici_activa: Option<BiciAlquilada>,
     dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
+    estado: bool,
+    sede_conectada: Option<SedeInfo>,
 }
 
 fn estado_path_de_id(cliente_id: u32) -> String {
@@ -87,6 +89,8 @@ impl Cliente {
             bici_activa: None,
             dinero,
             sedes_conocidas: vec![],
+            estado: true,
+            sede_conectada: None,
         }
     }
 
@@ -118,6 +122,10 @@ impl Cliente {
     }
 
     fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
+        if !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline"));
+        }
+
         let monto: f64 = monto.parse()
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput,format!("'{}' no es un numero valido", monto),)
@@ -146,9 +154,15 @@ impl Cliente {
 
         match reader.next_line().await {
             Ok(Some(line)) => match serde_json::from_str::<RespuestaHandshake>(&line) {
-                Ok(RespuestaHandshake::Aceptado) => {
+                Ok(RespuestaHandshake::Aceptado(coords)) => {
                     self.writer = Some(writer);
                     self.reader = Some(reader);
+                    let sede_id: u32 = n.parse().unwrap_or(0);
+                    self.sede_conectada = Some(SedeInfo {
+                        sede_id,
+                        coords,
+                        ..Default::default()
+                    });
                     println!("Conectado a sede {}", n);
                     Ok(())
                 }
@@ -161,6 +175,23 @@ impl Cliente {
             },
             _ => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "La sede cerro la conexion durante el handshake")),
         }
+    }
+
+    fn esta_en_rango(&self) -> bool {
+        match &self.sede_conectada {
+            Some(sede) => calcular_distancia(sede.coords, self.coords) <= DISTANCIA_MINIMA,
+            None => true,
+        }
+    }
+
+    fn online(&mut self) {
+        self.estado = true;
+        println!("[cliente] Estoy online");
+    }
+
+    fn offline(&mut self) {
+        self.estado = false;
+        println!("[cliente] Estoy offline");
     }
 
     fn print_sedes(sedes: &[SedeInfo], coords: (f64, f64)) {
@@ -179,6 +210,9 @@ impl Cliente {
         }
     }
     async fn pedir_sedes(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
         let coords = self.coords;
         let (writer, reader) = self.validar_conexion()?;
         let respuesta = Self::enviar_info_sedes_cercanas(coords, writer, reader).await?;
@@ -198,7 +232,7 @@ impl Cliente {
                 }
             }
         } else {
-            eprintln!("[warn] respuesta vacia, no se recibieron sedes");
+            eprintln!("[error] respuesta vacia, no se recibieron sedes");
         }
 
         Cliente::print_sedes(&self.sedes_conocidas, coords);
@@ -207,6 +241,10 @@ impl Cliente {
     }
 
     async fn solicitar_bici(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
+
         if self.bici_activa.is_some() {
             println!("[cliente] Ya tenes una bici");
             return Ok(());
@@ -277,6 +315,10 @@ impl Cliente {
     }
 
     async fn devolver_bici(&mut self) -> Result<(), io::Error> {
+        if !self.esta_en_rango() && !self.estado {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+        }
+
         if self.bici_activa.is_none() {
             return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
         }
@@ -411,6 +453,8 @@ async fn main() {
             ["devolver_bici"] => cliente.devolver_bici().await,
             ["info_bicis"] => cliente.info_bicis().await,
             ["bici"] => Ok(cliente.mostrar_bici()),
+            ["online"] => Ok(cliente.online()),
+            ["offline"] => Ok(cliente.offline()),
             ["ver_dinero"] => Ok(cliente.mostrar_dinero()),
             ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
@@ -435,6 +479,8 @@ fn listar_comandos() {
          {BOLD}Comandos disponibles:{RESET}\n\
          {GREEN}  mover <x> <y>{RESET}                  - Moverse una distancia\n\
          {GREEN}  conectar_sede <n>{RESET}              - Conectar a una sede\n\
+         {GREEN}  online{RESET}                         - Cambiar a modo online\n\
+         {GREEN}  offline{RESET}                        - Cambiar a modo offline\n\
          {GREEN}  solicitar_bici{RESET}                 - Solicitar una bici\n\
          {GREEN}  devolver_bici{RESET}                  - Devolver la bici\n\
          {GREEN}  info_bicis{RESET}                     - Ver bicis disponibles\n\
