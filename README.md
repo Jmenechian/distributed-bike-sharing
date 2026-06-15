@@ -233,12 +233,12 @@ El cliente lo envía al conectarse por TCP a una Sede, antes de cualquier otro m
 
 ```rs
 pub enum RespuestaHandshake {
-    Aceptado((f64, f64)),
+    Aceptado,
     Rechazado(String),
 }
 ```
 
-Si la Sede está offline y el cliente queda fuera de rango, responde `Rechazado` con el motivo y cierra la conexión. En caso contrario responde `Aceptado` con sus propias `coords`, que el cliente guarda en `sedes_posiciones` para futuras validaciones.
+Si la Sede está offline y el cliente queda fuera de rango, responde `Rechazado` con el motivo y cierra la conexión. En caso contrario responde `Aceptado`.
 
 #### DevolverBici
 
