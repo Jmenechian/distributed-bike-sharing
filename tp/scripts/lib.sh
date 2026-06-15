@@ -10,7 +10,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/procesador_pagos"
-CFG="$ROOT/src/bin"
+CFG="/src/bin/procesador_pagos"
 LOGDIR="$(mktemp -d)"
 
 declare -A PIDS

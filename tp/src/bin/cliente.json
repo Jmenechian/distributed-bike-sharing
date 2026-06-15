@@ -1,9 +1,0 @@
-{
-  "cliente_id": 43,
-  "coord_x": 34.6037,
-  "coord_y": 40.3816,
-  "dinero": 1000.0,
-  "sedes": [
-    {"sede_id": 1, "coord_x": 30.6037, "coord_y": 40.3816}
-  ]
-}
