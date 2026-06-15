@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA};
 use matenmutex::messages::sede_sede::SedeInfo;
+use std::collections::HashMap;
 use std::io::Write;
 
 const RESET: &str = "\x1b[0m";
@@ -21,11 +22,19 @@ const BOLD_CYAN: &str = "\x1b[1;36m";
 const CONFIG_FILE: usize = 1;
 
 #[derive(Deserialize)]
+struct SedePosicionConfig {
+    sede_id: u32,
+    coord_x: f64,
+    coord_y: f64,
+}
+
+#[derive(Deserialize)]
 struct ClienteConfig {
     cliente_id: u32,
     coord_x: f64,
     coord_y: f64,
     dinero: f64,
+    sedes: Vec<SedePosicionConfig>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -45,7 +54,8 @@ pub struct Cliente {
     dinero: f64,
     sedes_conocidas: Vec<SedeInfo>,
     estado: bool,
-    sede_conectada: Option<SedeInfo>,
+    sede_conectada: u32,
+    sedes_posiciones: HashMap<u32, (f64, f64)>,
 }
 
 fn estado_path_de_id(cliente_id: u32) -> String {
@@ -80,7 +90,7 @@ impl Actor for Cliente {
 }
 
 impl Cliente {
-    fn new(cliente_id: u32, coords: (f64, f64), dinero: f64) -> Self {
+    fn new(cliente_id: u32, coords: (f64, f64), dinero: f64, sedes_posiciones: HashMap<u32, (f64, f64)>) -> Self {
         Cliente {
             cliente_id,
             coords,
@@ -90,14 +100,18 @@ impl Cliente {
             dinero,
             sedes_conocidas: vec![],
             estado: true,
-            sede_conectada: None,
+            sede_conectada: 0,
+            sedes_posiciones,
         }
     }
 
     fn from_json(file_path: &str) -> Result<Cliente, Box<dyn std::error::Error>> {
         let file = File::open(file_path)?;
         let config: ClienteConfig = serde_json::from_reader(StdBufReader::new(file))?;
-        Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero))
+        let sedes_posiciones: HashMap<u32, (f64, f64)> = config.sedes.iter()
+            .map(|s| (s.sede_id, (s.coord_x, s.coord_y)))
+            .collect();
+        Ok(Cliente::new(config.cliente_id, (config.coord_x, config.coord_y), config.dinero, sedes_posiciones))
     }
 
     fn mover(&mut self, str_x: &str, str_y: &str) -> Result<(), io::Error> {
@@ -140,6 +154,21 @@ impl Cliente {
     }
 
     async fn conectar(&mut self, n: &str) -> Result<(), io::Error> {
+        let sede_id: u32 = n.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("'{}' no es un numero de sede valido", n))
+        })?;
+
+        if !self.sedes_posiciones.contains_key(&sede_id) {
+            return Err(io::Error::new(io::ErrorKind::Other, "[error] no conozco la sede"));
+        }
+
+        if !self.estado {
+            let sede_coords = self.sedes_posiciones[&sede_id];
+            if calcular_distancia(sede_coords, self.coords) > DISTANCIA_MINIMA {
+                return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+            }
+        }
+
         let addr = format!("127.0.0.1:808{}", n);
         let stream = TcpStream::connect(&addr).await?;
         let (read_half, write_half) = stream.into_split();
@@ -154,15 +183,10 @@ impl Cliente {
 
         match reader.next_line().await {
             Ok(Some(line)) => match serde_json::from_str::<RespuestaHandshake>(&line) {
-                Ok(RespuestaHandshake::Aceptado(coords)) => {
+                Ok(RespuestaHandshake::Aceptado) => {
                     self.writer = Some(writer);
                     self.reader = Some(reader);
-                    let sede_id: u32 = n.parse().unwrap_or(0);
-                    self.sede_conectada = Some(SedeInfo {
-                        sede_id,
-                        coords,
-                        ..Default::default()
-                    });
+                    self.sede_conectada = n.parse().unwrap_or(0);
                     println!("Conectado a sede {}", n);
                     Ok(())
                 }
@@ -178,9 +202,9 @@ impl Cliente {
     }
 
     fn esta_en_rango(&self) -> bool {
-        match &self.sede_conectada {
-            Some(sede) => calcular_distancia(sede.coords, self.coords) <= DISTANCIA_MINIMA,
-            None => true,
+        match self.sedes_posiciones.get(&self.sede_conectada) {
+            Some(&coords) => calcular_distancia(coords, self.coords) <= DISTANCIA_MINIMA,
+            None => false,
         }
     }
 
@@ -226,6 +250,12 @@ impl Cliente {
                         return Ok(());
                     }
                     self.sedes_conocidas = sedes;
+                    for sede in &self.sedes_conocidas {
+                        if !self.sedes_posiciones.contains_key(&sede.sede_id) {
+                            self.sedes_posiciones.insert(sede.sede_id, sede.coords);
+                            println!("[cliente] Nuevas sedes descubiertas: sede {} en ({:.4}, {:.4})", sede.sede_id, sede.coords.0, sede.coords.1);
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[error] fallo al deserializar sedes: {} | json: {}", e, json);
@@ -505,7 +535,7 @@ mod tests {
     use matenmutex::types::Bici;
 
     fn cliente_de_prueba() -> Cliente {
-        Cliente::new(1, (-34.6037, -58.3816), 9999999.0)
+        Cliente::new(1, (-34.6037, -58.3816), 9999999.0, HashMap::new())
     }
 
     fn bici_alquilada_de_prueba(bici_id: &str) -> BiciAlquilada {

@@ -643,7 +643,7 @@ impl Handler<Handshake> for Sede {
         if *self.offline.lock().unwrap_or_else(|e| e.into_inner()) && !self.cliente_en_rango(msg.coords) {
             MessageResult(RespuestaHandshake::Rechazado("Sede offline y fuera de rango".parse().unwrap()))
         } else {
-            MessageResult(RespuestaHandshake::Aceptado(self.coords))
+            MessageResult(RespuestaHandshake::Aceptado)
         }
     }
 }
