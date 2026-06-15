@@ -1034,6 +1034,15 @@ impl Handler<DevolverBici> for Sede {
 
                         let sede_origen_id = notificacion_devolucion.sede_origen_id;
 
+                        if sede_origen_id == sede_id {
+                            // La bici vuelve a su propia sede de origen: no hay nada que avisar
+                            // por TCP, resolvemos la notificación localmente.
+                            if let Ok(ack) = sede_addr.send(notificacion_devolucion.clone()).await {
+                                let _ = sede_addr.send(ConfirmarNotificacionOrigen { alquiler_id: ack.alquiler_id }).await;
+                            }
+                            return RespuestaDevolverBici::DevolucionOk(Bici { bici_id }, dinero - monto + PREMONTO);
+                        }
+
                         let yo_offline = *offline.lock().unwrap_or_else(|e| e.into_inner());
                         let origen_conectada = sedes_conocidas.iter()
                             .any(|sede| sede.sede_id == sede_origen_id && sede.conectada);
