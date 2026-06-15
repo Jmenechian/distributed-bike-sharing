@@ -141,7 +141,7 @@ teardown_cluster() {
 e1() {
     echo "== E1: seguro reembolsable en devolución normal (online) =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "ver_dinero"
@@ -159,7 +159,7 @@ e1() {
 e2() {
     echo "== E2: detección de robo + captura del depósito (online) =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
@@ -174,7 +174,7 @@ e2() {
 e3() {
     echo "== E3: robo revertido cross-sede (falso positivo corregido) =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
@@ -192,7 +192,7 @@ e3() {
 e4() {
     echo "== E4: robo revertido en la misma sede (camino local) =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
@@ -210,7 +210,7 @@ e4() {
 e5() {
     echo "== E5: sede destino OFFLINE encola y entrega al reconectar =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
@@ -233,7 +233,7 @@ e5() {
 e6() {
     echo "== E6 (borde): origen caído, encola y entrega cuando revive (flush por heartbeat) =="
     setup_cluster 1
-    levantar cliente cliente.json cli
+    levantar cliente cliente/cliente.json cli
     esperar 1
     enviar cli "conectar_sede 1"
     enviar cli "solicitar_bici"
