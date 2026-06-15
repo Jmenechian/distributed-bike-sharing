@@ -1,5 +1,5 @@
 use actix::{Actor, Context};
-use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, Handshake, MsgClienteASede, PedirSedes, PreguntarBicis, RespuestaHandshake, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::types::BiciAlquilada;
 use serde::{Deserialize, Serialize};
@@ -135,10 +135,32 @@ impl Cliente {
         let addr = format!("127.0.0.1:808{}", n);
         let stream = TcpStream::connect(&addr).await?;
         let (read_half, write_half) = stream.into_split();
-        self.writer = Some(write_half);
-        self.reader = Some(BufReader::new(read_half).lines());
-        println!("Conectado a sede {}", n);
-        Ok(())
+        let mut writer = write_half;
+        let mut reader = BufReader::new(read_half).lines();
+
+        let handshake = MsgClienteASede::Handshake(Handshake { coords: self.coords });
+        let payload = serde_json::to_string(&handshake)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            + "\n";
+        writer.write_all(payload.as_bytes()).await?;
+
+        match reader.next_line().await {
+            Ok(Some(line)) => match serde_json::from_str::<RespuestaHandshake>(&line) {
+                Ok(RespuestaHandshake::Aceptado) => {
+                    self.writer = Some(writer);
+                    self.reader = Some(reader);
+                    println!("Conectado a sede {}", n);
+                    Ok(())
+                }
+                Ok(RespuestaHandshake::Rechazado(razon)) => {
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, razon))
+                }
+                Err(e) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, format!("Handshake invalido: {}", e)))
+                }
+            },
+            _ => Err(io::Error::new(io::ErrorKind::ConnectionAborted, "La sede cerro la conexion durante el handshake")),
+        }
     }
 
     fn print_sedes(sedes: &[SedeInfo], coords: (f64, f64)) {

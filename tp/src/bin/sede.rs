@@ -1,7 +1,7 @@
 use actix::{Actor, Addr, AsyncContext, Context, Handler, MailboxError, Message, MessageResult, ResponseFuture};
 use matenmutex::common::{calcular_distancia, DISTANCIA_MINIMA, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT, MONITOR_INTERVAL, OFFLINE, ONLINE, PREMONTO, TASA};
 use matenmutex::log;
-use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, MsgClienteASede, PedirSedes, PreguntarBicis, SolicitarBici};
+use matenmutex::messages::cliente_sede::{AckComprobanteAlquiler, DevolverBici, Handshake, MsgClienteASede, PedirSedes, PreguntarBicis, RespuestaHandshake, SolicitarBici};
 use matenmutex::messages::sede_cliente::{RespuestaDevolverBici, RespuestaSolicitarBici};
 use matenmutex::messages::sede_procesador::{MsgProcesadorPagosASede, MsgSedeAProcesadorPagos};
 use matenmutex::messages::sede_sede::{AckDevolucion, ActualizarDisponibilidadDevolver, ActualizarDisponibilidadSolicitar, AlquilerActivo, DevolucionRecibida, EstadoAlquiler, EstadoConciliacion, GetAlquileresActivos, GetDevolucionesRecibidas, GetInfo, GetNotificacionesPendientes, GetSedesConocidas, GuardarAlquiler, GuardarDevolucion, Heartbeat, MsgSedeASede, MsgSedeHeartbeat, NotificacionPendiente, NotificarDevolucion, RemoverAlquiler, SedeInfo, VerificarRoboMasTarde};
@@ -632,6 +632,18 @@ impl Handler<RevertirRoboLocal> for Sede {
             log!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", msg.alquiler_id);
             println!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", msg.alquiler_id);
             ctx.address().do_send(PersistirEstado);
+        }
+    }
+}
+
+impl Handler<Handshake> for Sede {
+    type Result = MessageResult<Handshake>;
+
+    fn handle(&mut self, msg: Handshake, _ctx: &mut Self::Context) -> Self::Result {
+        if *self.offline.lock().unwrap_or_else(|e| e.into_inner()) && !self.cliente_en_rango(msg.coords) {
+            MessageResult(RespuestaHandshake::Rechazado("Sede offline — fuera de rango".into()))
+        } else {
+            MessageResult(RespuestaHandshake::Aceptado)
         }
     }
 }
@@ -2433,6 +2445,9 @@ async fn loop_pub(sede: Addr<Sede>, public_listener: TcpListener) {
 
             while let Ok(Some(line)) = lines.next_line().await {
                 let response = match serde_json::from_str::<MsgClienteASede>(line.trim()) {
+                    Ok(MsgClienteASede::Handshake(msg)) => {
+                        formatear_respuesta(sede.send(msg).await).await
+                    }
                     Ok(MsgClienteASede::SolicitarBici(msg)) => {
                         formatear_respuesta(sede.send(msg).await).await
                     }
