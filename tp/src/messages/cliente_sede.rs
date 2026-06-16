@@ -39,7 +39,7 @@ pub struct Handshake {
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum RespuestaHandshake {
-    Aceptado((f64, f64)),
+    Aceptado,
     Rechazado(String),
 }
 

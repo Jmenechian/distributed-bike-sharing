@@ -29,11 +29,12 @@ impl Cliente {
             io::Error::new(io::ErrorKind::InvalidInput, format!("'{}' no es un numero de sede valido", n))
         })?;
 
+        let sede_coords = self.sedes_posiciones.get(&sede_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "sede desconocida"))?;
+
         if !self.estado {
-            if let Some(&sede_coords) = self.sedes_posiciones.get(&sede_id) {
-                if calcular_distancia(sede_coords, self.coords) > DISTANCIA_MINIMA {
-                    return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
-                }
+            if calcular_distancia(*sede_coords, self.coords) > DISTANCIA_MINIMA {
+                return Err(io::Error::new(io::ErrorKind::Other, "estoy offline y fuera de rango"));
             }
         }
 
@@ -51,11 +52,10 @@ impl Cliente {
 
         match reader.next_line().await {
             Ok(Some(line)) => match serde_json::from_str::<RespuestaHandshake>(&line) {
-                Ok(RespuestaHandshake::Aceptado(coords)) => {
+                Ok(RespuestaHandshake::Aceptado) => {
                     self.writer = Some(writer);
                     self.reader = Some(reader);
                     self.sede_conectada = sede_id;
-                    self.sedes_posiciones.insert(sede_id, coords);
                     println!("Conectado a sede {}", n);
                     Ok(())
                 }
