@@ -13,7 +13,7 @@ pub(crate) fn sede_con_estados(estados: Vec<EstadoSlot>) -> Addr<Sede> {
     sede_con_estados_y_procesador(estados, PROCESADOR_PAGOS_ADDR_DEFAULT.to_string())
 }
 
-pub(crate) fn rellenar_ocupados_vacios_testing(estados: &Vec<EstadoSlot>) -> SedeInfo {
+pub(crate) fn rellenar_ocupados_vacios_testing(estados: &[EstadoSlot]) -> SedeInfo {
     let ocupados = estados.iter()
         .filter(|e| matches!(e, EstadoSlot::Disponible { .. }))
         .count() as u8;

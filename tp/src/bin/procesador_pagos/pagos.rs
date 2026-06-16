@@ -120,8 +120,8 @@ impl ProcesadorPagos {
             Ok(mut preparados) => preparados.remove(payment_request_id),
             Err(_) => None,
         };
-        if let Ok(mut pagos) = self.pagos_procesados.lock() {
-            if !pagos.iter().any(|p| p.payment_request_id == payment_request_id) {
+        if let Ok(mut pagos) = self.pagos_procesados.lock()
+            && !pagos.iter().any(|p| p.payment_request_id == payment_request_id) {
                 let pago = match &pendiente {
                     Some(operacion) => self.decidir_operacion(operacion).0,
                     None => PagoProcesado {
@@ -136,7 +136,6 @@ impl ProcesadorPagos {
                 };
                 pagos.push(pago);
             }
-        }
     }
 
     pub(crate) fn decidir_operacion(&self, msg: &MsgSedeAProcesadorPagos) -> (PagoProcesado, MsgProcesadorPagosASede) {
@@ -180,6 +179,7 @@ impl ProcesadorPagos {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolver_operacion(
         &self,
         payment_request_id: &str,

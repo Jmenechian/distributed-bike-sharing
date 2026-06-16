@@ -135,10 +135,10 @@ impl ProcesadorPagos {
         respuesta
     }
 
-    async fn broadcast_de_decision(self: &Arc<Self>, replicas: &[SocketAddr], payment_request_id: &String, estado_final: EstadoTransaccionPago) {
+    async fn broadcast_de_decision(self: &Arc<Self>, replicas: &[SocketAddr], payment_request_id: &str, estado_final: EstadoTransaccionPago) {
         let decision = match estado_final {
-            EstadoTransaccionPago::Commit => MsgProcesadorAProcesador::CommitPago { payment_request_id: payment_request_id.clone() },
-            _ => MsgProcesadorAProcesador::AbortPago { payment_request_id: payment_request_id.clone() },
+            EstadoTransaccionPago::Commit => MsgProcesadorAProcesador::CommitPago { payment_request_id: payment_request_id.to_string() },
+            _ => MsgProcesadorAProcesador::AbortPago { payment_request_id: payment_request_id.to_string() },
         };
         for peer in replicas {
             let peer_id = id_de_addr(peer);
@@ -175,11 +175,10 @@ impl ProcesadorPagos {
                 _ => EventoVoto2PC::Timeout,
             };
 
-            if let Ok(mut transacciones) = self.transacciones_en_curso.lock() {
-                if let Some(tx) = transacciones.iter_mut().find(|t| t.payment_request_id == *payment_request_id) {
+            if let Ok(mut transacciones) = self.transacciones_en_curso.lock()
+                && let Some(tx) = transacciones.iter_mut().find(|t| t.payment_request_id == *payment_request_id) {
                     aplicar_evento_2pc(tx, evento);
                 }
-            }
         }
     }
 

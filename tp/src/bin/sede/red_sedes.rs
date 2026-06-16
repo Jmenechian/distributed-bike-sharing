@@ -33,10 +33,7 @@ impl Handler<PedirSedes> for Sede {
             return MessageResult(vec![]);
         }
 
-        let sedes_cercanas: Vec<SedeInfo> = self.sedes_conocidas
-            .iter()
-            .cloned()
-            .collect();
+        let sedes_cercanas: Vec<SedeInfo> = self.sedes_conocidas.to_vec();
         let mut resultado = sedes_cercanas;
         resultado.push(self.sede_info.clone());
          MessageResult(resultado)
@@ -46,7 +43,7 @@ impl Handler<PedirSedes> for Sede {
 impl Handler<Heartbeat> for Sede {
     type Result = ();
 
-    fn handle(&mut self, msg: Heartbeat, ctx: &mut Context<Self>) -> () {
+    fn handle(&mut self, msg: Heartbeat, ctx: &mut Context<Self>) {
         log!("[sede] Recibe Heartbeat de {}", msg.sede_id);
         log!("[sede] info: {:?}", msg.info); //para debug
 

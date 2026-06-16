@@ -205,7 +205,7 @@ impl ProcesadorPagos {
         self.peers
             .iter()
             .copied()
-            .filter(|addr| mapa.get(addr).map_or(true, |info| info.estado == EstadoNodo::Vivo))
+            .filter(|addr| mapa.get(addr).is_none_or(|info| info.estado == EstadoNodo::Vivo))
             .collect()
     }
 

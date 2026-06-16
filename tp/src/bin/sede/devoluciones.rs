@@ -317,15 +317,14 @@ impl Handler<NotificarDevolucion> for Sede {
 
         // Si el alquiler estaba marcado como robo, esta devolución tardía lo revierte
         // (el deposito se lo reintegra el cliente en la sede destino).
-        if let Some(alquiler) = self.alquileres_activos.iter_mut().find(|a| a.alquiler_id == alquiler_id) {
-            if matches!(alquiler.estado, EstadoAlquiler::RoboConfirmado) {
+        if let Some(alquiler) = self.alquileres_activos.iter_mut().find(|a| a.alquiler_id == alquiler_id)
+            && matches!(alquiler.estado, EstadoAlquiler::RoboConfirmado) {
                 alquiler.estado = EstadoAlquiler::RoboRevertido;
                 log!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", alquiler_id);
                 println!("[sede] Robo revertido: el cliente devolvió la bici del alquiler {}", alquiler_id);
                 ctx.address().do_send(PersistirEstado);
                 return MessageResult(AckDevolucion { alquiler_id });
             }
-        }
 
         if self.alquiler_ya_procesado(&alquiler_id) { //idempotencia
             return MessageResult(AckDevolucion {alquiler_id: msg.alquiler_id});
@@ -333,7 +332,7 @@ impl Handler<NotificarDevolucion> for Sede {
 
         self.cerrar_alquiler(msg);
 
-        MessageResult(AckDevolucion {alquiler_id: alquiler_id})
+        MessageResult(AckDevolucion {alquiler_id})
     }
 }
 
@@ -452,14 +451,11 @@ impl Handler<FlushNotificacionesPendientes> for Sede {
                     continue;
                 }
                 let addr = format!("127.0.0.1:888{}", pendiente.sede_origen_id);
-                match enviar_notificacion(addr, notificacion).await {
-                    Ok(ack) => {
-                        log!("[sede {}]: reenvie la devolucion pendiente del alquiler {} a la sede {}", sede_id, pendiente.alquiler_id, pendiente.sede_origen_id);
-                        println!("[sede {}]: avise a la sede {} que tengo su bici (alquiler {}) y cerre el pago", sede_id, pendiente.sede_origen_id, pendiente.alquiler_id);
-                        sede_addr.do_send(ConfirmarNotificacionOrigen { alquiler_id: ack.alquiler_id.clone() });
-                        sede_addr.do_send(RemoverNotificacionPendiente { alquiler_id: ack.alquiler_id });
-                    }
-                    Err(_) => {}
+                if let Ok(ack) = enviar_notificacion(addr, notificacion).await {
+                    log!("[sede {}]: reenvie la devolucion pendiente del alquiler {} a la sede {}", sede_id, pendiente.alquiler_id, pendiente.sede_origen_id);
+                    println!("[sede {}]: avise a la sede {} que tengo su bici (alquiler {}) y cerre el pago", sede_id, pendiente.sede_origen_id, pendiente.alquiler_id);
+                    sede_addr.do_send(ConfirmarNotificacionOrigen { alquiler_id: ack.alquiler_id.clone() });
+                    sede_addr.do_send(RemoverNotificacionPendiente { alquiler_id: ack.alquiler_id });
                 }
             }
             // Se encola despues de los Remover, asi al limpiar la bandera la lista ya refleja
@@ -651,7 +647,7 @@ mod tests {
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+            RespuestaDevolverBici::DevolucionOk(..) => {
                 panic!("se esperaba DevolucionRechazada, se obtuvo DevolucionOk");
             }
         }
@@ -687,7 +683,7 @@ mod tests {
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+            RespuestaDevolverBici::DevolucionOk(..) => {
                 panic!("se esperaba DevolucionRechazada, se obtuvo DevolucionOk");
             }
         }
@@ -709,7 +705,7 @@ mod tests {
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+            RespuestaDevolverBici::DevolucionOk(..) => {
                 panic!("se esperaba DevolucionRechazada por estar fuera de rango, se obtuvo DevolucionOk");
             }
         }
@@ -731,7 +727,7 @@ mod tests {
 
         match respuesta {
             RespuestaDevolverBici::DevolucionRechazada(_) => {}
-            RespuestaDevolverBici::DevolucionOk(_, ..) => {
+            RespuestaDevolverBici::DevolucionOk(..) => {
                 panic!("se esperaba DevolucionRechazada por saldo insuficiente, se obtuvo DevolucionOk");
             }
         }
