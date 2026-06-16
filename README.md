@@ -18,6 +18,38 @@ Las aplicaciones principales del sistema son:
 
 Además, se describen entidades de soporte que viajan como datos dentro de los mensajes del sistema, como `Bici`, `BiciAlquilada`, `SedeInfo` y otros tipos internos utilizados por las Sedes para persistir y reconstruir su estado local.
 
+## Ejecución
+
+Todos los comandos se ejecutan desde la carpeta raíz `tp`. Cada binario recibe la ruta a su archivo de configuración como único argumento. El archivo `.env` de la raíz aporta `TOKEN_SECRET` y `PROCESADOR_PAGOS_ADDRS`, así que los binarios lo toman al correr desde ahí.
+
+El orden recomendado es levantar primero los `ProcesadorPagos`, después las Sedes y por último los Clientes.
+
+1. ProcesadorPagos (un líder y las réplicas que se quieran):
+
+```bash
+cargo run --bin procesador_pagos src/bin/procesador_pagos/lider.json
+cargo run --bin procesador_pagos src/bin/procesador_pagos/replica.json
+cargo run --bin procesador_pagos src/bin/procesador_pagos/replica3.json
+cargo run --bin procesador_pagos src/bin/procesador_pagos/replica4.json
+```
+
+2. Sedes:
+
+```bash
+cargo run --bin sede src/bin/sede/sede1.json
+cargo run --bin sede src/bin/sede/sede2.json
+```
+
+3. Clientes:
+
+```bash
+cargo run --bin cliente src/bin/cliente/cliente.json
+```
+
+Cada binario corre en su propia terminal y los Clientes y las Sedes se operan por su CLI. Hay configs adicionales en `src/bin/sede` (`sede3.json`, `sede4.json`) y en `src/bin/cliente` (`cliente_2.json`) para levantar más instancias.
+
+Se provee el archivo `.env.example` con las variables de entorno necesarias. Alcanza con copiarlo a `.env` en la raíz `tp` y completar los valores.
+
 ## Arquitectura de Aplicaciones Distribuidas
 El sistema está compuesto por varias aplicaciones independientes. Cada `Cliente`, cada `Sede` y cada `ProcesadorPagos` corre como un proceso separado. La comunicación entre estas aplicaciones no se realiza mediante `Addr<T>`, ya que las direcciones de actores solo son válidas dentro de un mismo proceso. Para la comunicación entre procesos se utilizan conexiones TCP y mensajes serializados.
 
