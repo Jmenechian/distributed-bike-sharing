@@ -27,6 +27,12 @@ pub struct TiemposBuilder {
     espera_coordinador: Duration,
 }
 
+impl Default for TiemposBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TiemposBuilder {
     pub fn new() -> Self {
         TiemposBuilder {

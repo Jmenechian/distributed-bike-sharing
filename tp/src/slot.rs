@@ -212,13 +212,25 @@ impl Handler<ConsultarEstado> for Slot {
     }
 }
 
+pub struct ActualizarSlots;
+
+impl Message for ActualizarSlots {
+    type Result = ();
+}
+pub struct SetSlotCounts {
+    pub ocupados: u8,
+    pub vacios: u8,
+}
+
+impl Message for SetSlotCounts {
+    type Result = ();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn estado_de(addr: &Addr<Slot>) -> impl std::future::Future<Output = String> + use<'_> {
-        async move { addr.send(ConsultarEstado).await.unwrap() }
-    }
+    async fn estado_de(addr: &Addr<Slot>) -> String { addr.send(ConsultarEstado).await.unwrap() }
 
     #[actix_rt::test]
     async fn reservar_sobre_disponible_transiciona_a_reservado() {
@@ -497,18 +509,4 @@ mod tests {
         assert_eq!(estado_de(&slots[1]).await, "vacio");
         assert_eq!(estado_de(&slots[2]).await, "reservado:9-3");
     }
-}
-
-pub struct ActualizarSlots;
-
-impl Message for ActualizarSlots {
-    type Result = ();
-}
-pub struct SetSlotCounts {
-    pub ocupados: u8,
-    pub vacios: u8,
-}
-
-impl Message for SetSlotCounts {
-    type Result = ();
 }

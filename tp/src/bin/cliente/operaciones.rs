@@ -29,7 +29,7 @@ impl Cliente {
 
     pub(crate) async fn pedir_sedes(&mut self) -> Result<(), io::Error> {
         if !self.esta_en_rango() && !self.estado {
-            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+            return Err(io::Error::other("[error] estoy offline y fuera de rango"));
         }
         let coords = self.coords;
         let (writer, reader) = self.validar_conexion()?;
@@ -45,8 +45,8 @@ impl Cliente {
                     }
                     self.sedes_conocidas = sedes;
                     for sede in &self.sedes_conocidas {
-                        if !self.sedes_posiciones.contains_key(&sede.sede_id) {
-                            self.sedes_posiciones.insert(sede.sede_id, sede.coords);
+                        if let std::collections::hash_map::Entry::Vacant(e) = self.sedes_posiciones.entry(sede.sede_id) {
+                            e.insert(sede.coords);
                             println!("[cliente] Nuevas sedes descubiertas: sede {} en ({:.4}, {:.4})", sede.sede_id, sede.coords.0, sede.coords.1);
                         }
                     }
@@ -66,7 +66,7 @@ impl Cliente {
 
     pub(crate) async fn solicitar_bici(&mut self) -> Result<(), io::Error> {
         if !self.esta_en_rango() && !self.estado {
-            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+            return Err(io::Error::other("[error] estoy offline y fuera de rango"));
         }
 
         if self.bici_activa.is_some() {
@@ -132,23 +132,23 @@ impl Cliente {
                 Ok((bici,dinero))
             }
             Some(RespuestaSolicitarBici::AlquilerRechazado(motivo)) => {
-                Err(io::Error::new(io::ErrorKind::Other, format!("Alquiler rechazado: {motivo}")))
+                Err(io::Error::other(format!("Alquiler rechazado: {motivo}")))
             }
-            _ => { Err(io::Error::new(io::ErrorKind::Other, "Respuesta inesperada de la sede")) }
+            _ => { Err(io::Error::other("Respuesta inesperada de la sede")) }
         }
     }
 
     pub(crate) async fn devolver_bici(&mut self) -> Result<(), io::Error> {
         if !self.esta_en_rango() && !self.estado {
-            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline y fuera de rango"));
+            return Err(io::Error::other("[error] estoy offline y fuera de rango"));
         }
 
         if self.bici_activa.is_none() {
-            return Err(io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver"));
+            return Err(io::Error::other("No hay bici activa para devolver"));
         }
 
         let bici = self.bici_activa.clone().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "No hay bici activa para devolver")
+            io::Error::other("No hay bici activa para devolver")
         })?;
         let coords = self.coords;
         let dinero = self.dinero;

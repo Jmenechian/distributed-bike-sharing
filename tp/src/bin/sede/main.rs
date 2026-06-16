@@ -386,6 +386,7 @@ fn crear_sede_info(n: u16, sede_id: u32, coords: (f64, f64)) -> SedeInfo {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn crear_sede(
     token_secret: [u8; 32],
     sede_id: u32,
@@ -402,7 +403,8 @@ fn crear_sede(
         .map(|(alquiler_id, slot_idx, bici)| (alquiler_id, (slot_idx, bici)))
         .collect();
 
-    let sede = Sede {
+    
+    Sede {
         sede_id,
         coords,
         slots,
@@ -421,8 +423,7 @@ fn crear_sede(
         estaba_offline: false,
         flush_en_curso: false,
     }
-        .start();
-    sede
+        .start()
 }
 
 fn cargar_token_secret() -> Option<[u8; 32]> {

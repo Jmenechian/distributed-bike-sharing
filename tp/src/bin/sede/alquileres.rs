@@ -55,7 +55,7 @@ impl Sede {
         Ok(BiciAlquilada::new(bici_id, alquiler_id, cliente_id.to_string(), sede_id, inicio_ts, token_alquiler))
     }
 
-    async fn reservar_bici(slots: &Vec<Addr<Slot>>) -> Option<(usize, String)> {
+    async fn reservar_bici(slots: &[Addr<Slot>]) -> Option<(usize, String)> {
 
         let mut bici_ganadora: Option<(usize, String)> = None;
         for (idx, slot) in slots.iter().enumerate() {
@@ -74,15 +74,16 @@ impl Sede {
 
     pub(crate) fn generar_msg_de_cobro(monto: f64, alquiler_id: String, cliente_id: String) -> MsgSedeAProcesadorPagos {
         let payment_request_id = Uuid::new_v4().to_string();
-        let cobro = MsgSedeAProcesadorPagos::CobrarPago {
+        
+        MsgSedeAProcesadorPagos::CobrarPago {
             payment_request_id,
             alquiler_id,
             cliente_id,
             monto_final: monto,
-        };
-        cobro
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalizar_reserva(
         slots: &[Addr<Slot>],
         sede_id: u32,
@@ -129,6 +130,7 @@ impl Sede {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn procesar_respuesta_preautorizacion(slots: Vec<Addr<Slot>>, sede_id: u32, cliente_id: u32, dinero: f64, token_secret: &[u8; 32], sede_addr: Addr<Sede>, idx: usize, bici_id: String, preautorizacion: Result<MsgProcesadorPagosASede, Error>) -> RespuestaSolicitarBici {
         match preautorizacion {
             Ok(MsgProcesadorPagosASede::PagoPreAutorizado { payment_request_id, pago_id }) => {
@@ -190,7 +192,7 @@ impl Handler<SolicitarBici> for Sede {
                     let solicitud_pre_autorizacion = MsgSedeAProcesadorPagos::PreAutorizarPago {
                         payment_request_id: Uuid::new_v4().to_string(),
                         cliente_id: cliente_id.to_string(),
-                        monto_seguridad: PREMONTO as f64,
+                        monto_seguridad: PREMONTO,
                     };
 
                     if offline {

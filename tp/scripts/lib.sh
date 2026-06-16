@@ -10,7 +10,7 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug/procesador_pagos"
-CFG="/src/bin/procesador_pagos"
+CFG="$ROOT/src/bin/procesador_pagos"
 LOGDIR="$(mktemp -d)"
 
 declare -A PIDS
@@ -52,12 +52,15 @@ esperar() {
 }
 
 # assert_log <id> <patron_regex> <descripcion>
+# Los nodos escriben su log con log! en $ROOT/logs/procesador<id>.log, no en el stdout
+# redirigido por levantar (que solo recibe el banner de la CLI).
 assert_log() {
-    if grep -qE "$2" "$LOGDIR/$1.log"; then
+    local archivo="$ROOT/logs/procesador$1.log"
+    if grep -qE "$2" "$archivo"; then
         echo "  PASS: $3"
     else
         echo "  FAIL: $3"
-        echo "        (no aparece /$2/ en el log del nodo $1: $LOGDIR/$1.log)"
+        echo "        (no aparece /$2/ en el log del nodo $1: $archivo)"
         FALLOS=$((FALLOS + 1))
     fi
 }

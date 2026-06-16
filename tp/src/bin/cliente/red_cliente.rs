@@ -30,13 +30,12 @@ impl Cliente {
         })?;
 
         let sede_coords = self.sedes_posiciones.get(&sede_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "sede desconocida"))?;
+            .ok_or_else(|| io::Error::other("sede desconocida"))?;
 
-        if !self.estado {
-            if calcular_distancia(*sede_coords, self.coords) > DISTANCIA_MINIMA {
-                return Err(io::Error::new(io::ErrorKind::Other, "estoy offline y fuera de rango"));
+        if !self.estado
+            && calcular_distancia(*sede_coords, self.coords) > DISTANCIA_MINIMA {
+                return Err(io::Error::other("estoy offline y fuera de rango"));
             }
-        }
 
         let addr = format!("127.0.0.1:808{}", n);
         let stream = TcpStream::connect(&addr).await?;

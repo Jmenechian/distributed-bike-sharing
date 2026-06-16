@@ -106,7 +106,7 @@ impl Cliente {
 
     fn recargar_dinero(&mut self, monto: &str) -> Result<(), io::Error> {
         if !self.estado {
-            return Err(io::Error::new(io::ErrorKind::Other, "[error] estoy offline"));
+            return Err(io::Error::other("[error] estoy offline"));
         }
 
         let monto: f64 = monto.parse()
@@ -180,17 +180,33 @@ async fn main() {
             ["solicitar_bici"] => cliente.solicitar_bici().await,
             ["devolver_bici"] => cliente.devolver_bici().await,
             ["info_bicis"] => cliente.info_bicis().await,
-            ["bici"] => Ok(cliente.mostrar_bici()),
-            ["online"] => Ok(cliente.online()),
-            ["offline"] => Ok(cliente.offline()),
-            ["ver_dinero"] => Ok(cliente.mostrar_dinero()),
+            ["bici"] => {
+                let _: () = cliente.mostrar_bici();
+                Ok(())
+            },
+            ["online"] => {
+                let _: () = cliente.online();
+                Ok(())
+            },
+            ["offline"] => {
+                let _: () = cliente.offline();
+                Ok(())
+            },
+            ["ver_dinero"] => {
+                let _: () = cliente.mostrar_dinero();
+                Ok(())
+            },
             ["recarga", n] => cliente.recargar_dinero(n),
             ["pedir_sedes"] => cliente.pedir_sedes().await,
-            ["ver_comandos"] => Ok(listar_comandos()),
-            ["clear"] => Ok({
+            ["ver_comandos"] => {
+                listar_comandos();
+                Ok(())
+            },
+            ["clear"] => {
                 limpiar_pantalla();
                 listar_comandos();
-            }),
+                Ok(())
+            },
             ["quit"] => break,
             _ => {
                 println!("Comando Invalido: '{}'", input);
@@ -253,6 +269,6 @@ mod tests {
         let invalid_x = "test";
         let invalid_y = "test";
 
-        assert!(cliente.mover(&invalid_x, &invalid_y).is_err());
+        assert!(cliente.mover(invalid_x, invalid_y).is_err());
     }
 }
