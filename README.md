@@ -1,3 +1,22 @@
+# Distributed bike sharing (Rust)
+
+A bike rental system for a city with no central server. Every client, station and payment processor runs as its own process, and they talk over TCP and UDP. We built it in Rust with Actix and Tokio, as a team of three, for Programación Concurrente at FIUBA.
+
+The full design report below is in Spanish. In short:
+
+- Stations are all peers. They share availability through heartbeats, and you can rent a bike at one station and return it at another. The return station checks the rental token and notifies the original station.
+- A rental is a saga: reserve a slot, pre-authorize the payment, confirm. If a step fails, the earlier ones are undone.
+- Payment processors elect a leader with the Bully algorithm, and the leader replicates every payment with two-phase commit.
+- After each change, a station saves its state to a JSON snapshot (it writes a temp file and then renames it). On restart it loads the snapshot and cancels any rental that was left halfway.
+- A station that loses connection keeps renting and accepting returns locally. It queues what it couldn't send and flushes the queue when it's back online.
+- If a bike isn't returned in time, it's marked as stolen and the deposit is charged. If it shows up later, the deposit is refunded.
+
+There are end-to-end test scripts in `tp/scripts/` for leader election and the theft flow. The steps to run it are in [Ejecución](#ejecución).
+
+What I worked on: the station (Sede) and client apps. That covers renting and returning bikes, heartbeats between stations, notifying the original station when a bike is returned somewhere else, rental token validation, theft detection, saving station state to snapshots, and the offline/online mode with reconnection.
+
+---
+
 # Informe Concu — Sistema de Alquiler de Bicicletas
 
 | Nombre del integrante            | Padrón  |
